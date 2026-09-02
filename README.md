@@ -35,19 +35,28 @@ Four small pieces coordinated by an explicit state machine — see
 * **`dice_common.py`** — the perception *contract* (`/dice_identification`):
   the simulator today, a real camera node tomorrow, same interface either way.
 * **`dice_manipulation_node`** — the pick/roll/place *skill*: identify → pick
-  (grasp aligned with live `dice_tf`) → lift → align the gripper's opening
-  axis to the roll's axis (so release is always exactly horizontal) → roll a
-  quarter turn about a fixed **world** axis, near the table → release → report
-  `face X -> face Y`. Doesn't decide *which* roll — that's the next node.
-* **`dice_face_map.py`** — pure-Python model of *this* die: learns online
-  which face a given roll produces from a given face (no ROS, unit-tested in
-  `test/test_dice_face_map.py`), using an opposite-faces-sum-geometry shortcut
-  plus breadth-first search over whatever has actually been observed.
+  (grasp aligned with live `dice_tf`, yaw pre-chosen for the upcoming roll
+  *before* contact) → lift → roll a quarter turn about a fixed **world** axis
+  (`x +90°` or `y -90°`, never about world **Z**) near the table → release →
+  report `face X -> face Y`. Doesn't decide *which* roll — that's the next
+  node.
+* **`dice_face_map.py`** — pure-Python, closed-form model of *this* die.
+  Real perception can only ever report *which number* is up, never the die's
+  precise yaw (a top face is a square; several pip patterns are themselves
+  rotationally symmetric) — so `from_two_faces()` fixes the whole six-face
+  layout exactly from one *known, commanded* roll and the two face numbers
+  around it, no yaw reading needed at all (no ROS, unit-tested in
+  `test/test_dice_face_map.py`). From there `plan_min_sequence()` finds the
+  *provably minimal* roll sequence to any target face by BFS over the
+  reachable orientation graph — at most 3 more rolls, any face from any
+  already-known orientation.
 * **`dice_task_orchestrator`** — the "smart" layer, an explicit state machine
-  (`IDENTIFY → CHECK_TARGET → PLAN → ROLL → VERIFY → …`, see its module
-  docstring): given a `target_face` (1-6), loops until reached or
-  `max_attempts` is hit, driving `dice_manipulation_node` and feeding
-  `dice_face_map` with what actually happened.
+  (`IDENTIFY → CALIBRATE (if needed) → CHECK_TARGET → PLAN → ROLL → VERIFY →
+  …`, see its module docstring): given a `target_face` (1-6), spends at most
+  one roll calibrating the die's layout (only when it isn't already tracked),
+  then loops until reached or `max_attempts` is hit, driving
+  `dice_manipulation_node` and re-deriving the die's orientation exactly
+  (never a mere prediction) after every further roll.
 
 ```bash
 # both nodes together

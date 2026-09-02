@@ -19,82 +19,106 @@ Two ways to drive it -- pick one per use case:
 
 **Interactive / supervised** (recommended while tuning a new cell):
 ``~/plan_target_face`` then ``~/execute_planned_sequence``. The first
-call identifies the die and, if a full path to ``target_face`` is not
-known yet, does **exactly one** physical roll to learn a bit more --
-never more than one per call -- then reports either the complete
-sequence found or that another call is needed to explore further.
-Nothing is executed beyond that single exploratory roll until you
-separately call ``~/execute_planned_sequence``, which runs the last
-planned sequence end to end. This is the only path that lets you watch
-each roll happen and stop/inspect between them. Depending on how much of
-the die is already known, reaching a genuinely new target can still take
-several ``~/plan_target_face`` calls, each contributing one roll of
-information (see ``dice_face_map``'s module docstring for exactly why
-this cannot be shortcut to "always one roll" on this robot cell).
+call identifies the die and, if the die's full layout is not already
+known (see "Calibration" below), does **exactly one** physical roll to
+learn it -- never more than one, and never again afterwards unless
+something desyncs the tracked state (see below) -- then reports the
+complete, provably minimal roll sequence to ``target_face``. Nothing is
+executed until you separately call ``~/execute_planned_sequence``, which
+runs that sequence end to end. This is the path that lets you watch each
+roll happen and stop/inspect between them.
 
 **Fully automatic**: ``~/reach_target_face`` runs the whole thing
 unattended as an explicit state machine (``State`` below):
 
 .. code-block:: text
 
-    IDENTIFY ──► CHECK_TARGET ──(match)──► DONE
-                      │
-                (no match, attempts left)
-                      ▼
-                    PLAN ──(no move known)──► FAILED
-                      │
-                      ▼
-                    ROLL ──(hard failure)──► FAILED
-                      │        │
-                      │   (recoverable failure: re-identify, loop back to
-                      │    CHECK_TARGET without a new roll being recorded)
-                      ▼
-                   VERIFY ──► back to CHECK_TARGET
+    IDENTIFY ──► CALIBRATE (if needed) ──► CHECK_TARGET ──(match)──► DONE
+                                                 │
+                                       (no match, attempts left)
+                                                 ▼
+                                               PLAN ──(no move known)──► FAILED
+                                                 │
+                                                 ▼
+                                               ROLL ──(hard failure)──► FAILED
+                                                 │        │
+                                                 │   (recoverable: re-identify,
+                                                 │    loop back to IDENTIFY)
+                                                 ▼
+                                              VERIFY ──► back to CHECK_TARGET
+
+Calibration -- why this node ever needs to roll before it can plan
+---------------------------------------------------------------------
+Real perception can reliably report *which number* is up, never the
+die's precise yaw on the table (a top face is a square, and several pip
+patterns are themselves rotationally symmetric -- see
+``dice_face_map``'s module docstring, "Why two faces, not one"). So a
+single ``/dice_identification`` reading is **not** enough to know where
+the other five faces are; the only way to find out is to execute one
+*known* roll and observe the resulting face number
+(``DiceOrientation.from_two_faces()``). This node tracks the die's full
+orientation (``self._orientation``) for as long as it keeps matching
+reality: every ``IDENTIFY`` compares the freshly-read face against what
+is tracked, and only pays for a calibration roll when they disagree (the
+very first call ever, or after anything that could have desynced them --
+see ``_calibrate()``). Once calibrated, every subsequent roll is both
+executed *and* used to re-derive the orientation fresh via
+``from_two_faces()`` (cheap, exact, and self-correcting: it never trusts
+a mere prediction over what was actually observed).
 
 * **IDENTIFY** asks the perception layer (``/dice_identification``,
   ``dice_common.py``) which face is currently up.
-* **CHECK_TARGET** compares the current face to ``target_face``; also
+* **CALIBRATE** (only entered when the tracked orientation is missing or
+  stale) performs exactly one roll purely to (re)establish the full
+  layout -- see above.
+* **CHECK_TARGET** compares the current up face to ``target_face``; also
   where the ``max_attempts`` budget is enforced.
-* **PLAN** asks ``dice_face_map.DiceFaceMap`` (a pure-Python model of
-  *this* die — see that module) for the next roll to try, purely from
-  what has actually been observed so far (see that module's docstring
-  for why this is deliberately *not* solved from live orientation).
+* **PLAN** asks ``dice_face_map.plan_min_sequence()`` -- pure geometry,
+  no ROS -- for the *shortest possible* full sequence to ``target_face``
+  from the current orientation, and takes its first move (re-planning
+  fresh after every physical roll costs nothing: the search space is at
+  most the 24 rotations of a cube).
 * **ROLL** configures ``dice_manipulation_node`` for that roll (its
   ``set_parameters`` service) and drives it through one full
   pick-lift-roll-place cycle (its ``~/pick_rotate_place`` service). A
-  roll that fails because the tool could not be *aligned* to the axis
-  (``'grip alignment failed'``) is treated exactly like a roll that
-  fails during the turn itself (``'rotation failed'``): both are a
-  motion-layer statement that this exact (face, axis) is unreachable,
-  so both get permanently excluded via ``mark_infeasible()`` -- see
+  roll that fails during the turn itself (``'rotation failed'``) is a
+  motion-layer statement that this exact (orientation, axis) is
+  unreachable, so it gets permanently excluded via the ``_blocked`` set
+  passed to every subsequent ``plan_min_sequence()`` call -- see
   ``_try_roll()``.
-* **VERIFY** re-identifies the die and feeds the (roll, resulting face)
-  observation back into the map.
+* **VERIFY** re-identifies the die and re-derives the full orientation
+  from ``(face before this roll, this roll, face after)`` via
+  ``from_two_faces()`` -- exact by construction, not a prediction that
+  could turn out wrong.
 
-Both paths share the same underlying ``DiceFaceMap`` instance and the
-same roll-execution helper (``_try_roll()``), so exploration done via
-one shows up in the other.
+Both paths share the same roll-execution helper (``_try_roll()``) and the
+same ``_blocked`` set of known-kinematically-infeasible rolls, so
+exploration done via one shows up in the other.
 
 This node only ever talks to two contracts:
 
     * ``/dice_identification`` (perception — the simulator today, a real
-      vision node tomorrow, see ``dice_common.py``);
+      vision node tomorrow, see ``dice_common.py``) -- and only ever
+      reads its ``face_number``, never trusting its orientation for
+      layout purposes (see "Calibration" above);
     * ``dice_manipulation_node``'s ``set_parameters`` and
       ``~/pick_rotate_place`` services.
 
 It never talks to MoveIt / the gripper / TF directly, and it never
-assumes the simulator's internal geometry — everything about how a roll
-maps faces to faces is learned online by ``dice_face_map`` from what
-actually happens.
+assumes the simulator's internal geometry beyond the die's own numbering
+(``dice_face_map.STANDARD_BODY_NORMALS``, documented there) -- how a roll
+maps orientations to orientations is plain rotation geometry, not
+anything learned from the simulator.
 
 Interfaces
 ----------
 * Parameter ``target_face`` (1-6): the face the die should end up showing.
 * Service ``~/plan_target_face`` (``std_srvs/srv/Trigger``): identify,
-  explore at most one roll if needed, report the minimal sequence found
-  (or that more exploration is needed) without executing it.
+  calibrate with at most one physical roll if needed, and report the
+  complete minimal roll sequence towards ``target_face``.
 * Service ``~/execute_planned_sequence`` (``std_srvs/srv/Trigger``): run
-  the sequence ``~/plan_target_face`` last reported, roll by roll.
+  the sequence ``~/plan_target_face`` last reported, roll by roll,
+  re-deriving the tracked orientation after each one.
 * Service ``~/reach_target_face`` (``std_srvs/srv/Trigger``): (re-)runs
   the fully-automatic state machine for the currently configured
   ``target_face``, with no pause for confirmation.
@@ -105,13 +129,12 @@ To change the target at runtime without restarting::
 
     ros2 param set /dice_task_orchestrator target_face 6
     ros2 service call /dice_task_orchestrator/plan_target_face std_srvs/srv/Trigger "{}"
-    # inspect the logged sequence (repeat the call above if it reports
-    # more exploration is needed), then:
+    # inspect the logged sequence, then:
     ros2 service call /dice_task_orchestrator/execute_planned_sequence std_srvs/srv/Trigger "{}"
 """
 
 from enum import Enum, auto
-from typing import List, Optional, Tuple
+from typing import Optional, Set, Tuple
 
 import rclpy
 from rclpy.node import Node
@@ -121,7 +144,7 @@ from rcl_interfaces.srv import SetParameters
 from rclpy.parameter import Parameter
 
 from drims_homework.dice_common import create_dice_identification_client, identify_dice
-from drims_homework.dice_face_map import DiceFaceMap, Move
+from drims_homework.dice_face_map import CANDIDATE_ROLLS, DiceOrientation, Move, plan_min_sequence
 
 # pick_rotate_place() failure messages that mean the dice was never
 # touched, or the roll layer itself already gave up recovering -- not
@@ -133,9 +156,14 @@ _UNRECOVERABLE_FAILURES = frozenset({
     'failed to reach home', 'pick failed', 'dice identification failed',
 })
 
+# (orientation.signature(), move) pairs already found kinematically
+# infeasible -- see plan_min_sequence()'s `blocked` argument.
+Blocked = Set[Tuple[tuple, Move]]
+
 
 class State(Enum):
     IDENTIFY = auto()
+    CALIBRATE = auto()
     CHECK_TARGET = auto()
     PLAN = auto()
     ROLL = auto()
@@ -170,16 +198,24 @@ class DiceTaskOrchestrator:
         self._set_parameters_client = self._client_node.create_client(
             SetParameters, f'/{self.manipulation_node_name}/set_parameters')
 
-        # The die's roll->face transition graph, learned online. Kept for
-        # this node's whole lifetime: a physical property of the die, not
-        # of a single reach_target_face()/plan_target_face() request.
-        self._map = DiceFaceMap()
+        # The die's tracked orientation, or None if not (yet) known --
+        # see the module docstring's "Calibration". Kept for this node's
+        # whole lifetime, like _blocked below: nothing but this node
+        # drives the arm, so it stays valid across requests until an
+        # IDENTIFY ever disagrees with it.
+        self._orientation: Optional[DiceOrientation] = None
 
-        # Last target plan_target_face() found a full path for, consumed
-        # by execute_planned_sequence(). Not persisted across a node
-        # restart -- deliberately: re-planning is cheap and re-deriving
-        # it fresh at execute time from the die's *live* face is safer
-        # than trusting a stale plan if something moved the die meanwhile.
+        # Rolls already found kinematically infeasible at a given exact
+        # orientation -- see dice_face_map.plan_min_sequence()'s
+        # `blocked` argument. Kept for this node's whole lifetime: a
+        # physical property of this robot cell, not of a single
+        # reach_target_face()/plan_target_face() request.
+        self._blocked: Blocked = set()
+
+        # Target plan_target_face() last found a sequence for, consumed
+        # by execute_planned_sequence(). Not the sequence itself -- that
+        # is always re-derived live at execute time (see
+        # execute_planned_sequence()'s docstring).
         self._pending_target: Optional[int] = None
 
     # ------------------------------------------------------------------ #
@@ -219,8 +255,14 @@ class DiceTaskOrchestrator:
             return False, 'pick_rotate_place call failed (no response)'
         return result.success, result.message
 
-    def _identify(self) -> Optional[int]:
-        """Identify the die; return the face number, or None on failure."""
+    def _identify_face(self) -> Optional[int]:
+        """
+        Identify the die; return the face number, or None on failure.
+
+        Only ``face_number`` is used -- never the reported orientation,
+        see the module docstring's "Calibration" for why that would not
+        be trustworthy against real perception.
+        """
         face, pose = identify_dice(self._client_node, self._dice_identification_client)
         if face is None or pose is None:
             return None
@@ -230,21 +272,28 @@ class DiceTaskOrchestrator:
     # Shared roll execution (used by both the automatic state machine    #
     # and the interactive plan/execute pair below)                       #
     # ------------------------------------------------------------------ #
-    def _try_roll(self, face: int, move: Move) -> Tuple[str, str]:
+    def _try_roll(self, orientation: Optional[DiceOrientation], move: Move) -> Tuple[str, str]:
         """
         Configure and execute one physical roll.
+
+        ``orientation`` is the tracked state *before* this roll, used
+        only to key ``self._blocked`` on a kinematic failure -- pass
+        ``None`` during calibration, when it is not known yet (nothing
+        gets blocked in that case; there is no exact orientation to key
+        it on).
 
         Returns ``(outcome, message)`` where ``outcome`` is one of:
 
         * ``'ok'`` -- the roll executed; the caller should re-identify
-          and ``self._map.record(face, move, new_face)``.
+          and rebuild the tracked orientation via ``from_two_faces()``.
         * ``'recoverable'`` -- it failed but ``dice_manipulation_node``
-          already put the dice back down best-effort; ``(face, move)``
-          has been marked infeasible if the failure was kinematic
-          (``'rotation failed'`` or ``'grip alignment failed'`` -- both
-          mean this exact axis is unreachable from this exact face, see
-          the module docstring); the caller should re-identify to get
-          the real (possibly unchanged) state and keep going.
+          already put the dice back down best-effort; ``move`` has been
+          added to ``self._blocked`` at this exact ``orientation`` if the
+          failure was kinematic (``'rotation failed'`` -- the motion
+          layer could not actually turn the die about this axis from
+          here) and ``orientation`` was known; the caller should
+          re-identify to get the real (possibly unchanged) state and
+          keep going.
         * ``'hard'`` -- unrecoverable; the caller must give up,
           ``message`` explains why.
         """
@@ -259,161 +308,164 @@ class DiceTaskOrchestrator:
         if message in _UNRECOVERABLE_FAILURES:
             return 'hard', f'pick_rotate_place failed: {message}'
 
-        if message in ('rotation failed', 'grip alignment failed'):
-            # Both mean the motion layer could not reach this exact axis
-            # from this exact face -- never try it again from here.
-            self._map.mark_infeasible(face, move)
-            self._log.warn(
-                f'Roll axis={axis} {angle:+.0f} deg from face {face} is '
-                f'infeasible for this robot configuration ({message}); '
-                f'avoiding it from now on.')
+        if message == 'rotation failed':
+            # The motion layer could not actually turn the die about this
+            # axis from this exact orientation -- never try it again from
+            # here (plan_min_sequence() will route around it). Only
+            # recordable if we actually knew the orientation this roll
+            # started from (not during calibration).
+            if orientation is not None:
+                self._blocked.add((orientation.signature(), move))
+                self._log.warn(
+                    f'Roll axis={axis} {angle:+.0f} deg is infeasible at orientation '
+                    f'[{orientation.describe()}]; avoiding it from now on.')
+            else:
+                self._log.warn(
+                    f'Calibration roll axis={axis} {angle:+.0f} deg failed '
+                    f'(rotation failed); trying the next candidate.')
         else:
             # 'lift failed' / 'place failed': not necessarily this roll's
             # fault -- re-check state, keep going, don't blacklist the move.
             self._log.warn(f'pick_rotate_place failed ({message}); re-checking state.')
         return 'recoverable', message
 
-    def _describe_sequence(self, face: int, target: int, sequence: List[Move]) -> str:
+    def _calibrate(self, face: int) -> Tuple[Optional[int], str]:
+        """
+        (Re-)establish the die's full tracked orientation with one physical roll.
+
+        Tries each of ``CANDIDATE_ROLLS`` in turn (a die's layout does
+        not depend on which roll calibrates it) until one executes;
+        ``self._orientation`` is set from the observed
+        ``(face, move, new_face)`` via ``from_two_faces()`` on success.
+        Returns ``(new_face, '')`` on success or ``(None, error)`` if
+        every candidate failed.
+        """
+        for move in CANDIDATE_ROLLS:
+            outcome, message = self._try_roll(None, move)
+            if outcome == 'hard':
+                return None, f'calibration roll failed: {message}'
+            new_face = self._identify_face()
+            if new_face is None:
+                return None, 'post-calibration-roll dice identification failed'
+            if outcome == 'ok':
+                self._orientation = DiceOrientation.from_two_faces(face, move, new_face)
+                self._log.info(
+                    f'Calibrated: face {face} --{move[0]}{move[1]:+.0f}deg--> face '
+                    f'{new_face}; full layout now known: {self._orientation.describe()}')
+                return new_face, ''
+            face = new_face  # 'recoverable' -- try the next candidate from here
+        return None, f'could not calibrate: every candidate roll failed from face {face}'
+
+    def _describe_sequence(self, face: int, target: int, sequence) -> str:
         if not sequence:
             return f'Face {face} is already {target}.'
         steps = ', '.join(f'{axis}{angle:+.0f}deg' for axis, angle in sequence)
-        return (f'Minimal known sequence from face {face} to face {target}: '
+        return (f'Minimal sequence from face {face} to face {target}: '
                 f'{len(sequence)} roll(s) [{steps}]. Call '
                 f'~/execute_planned_sequence to run it.')
 
-    def _report_if_known(self, face: int, target_face: int) -> Optional[Tuple[bool, str]]:
-        """
-        If ``target_face`` is already reachable from ``face`` via the known table, report it.
-
-        Returns None (nothing to report yet) if there is no fully-known
-        path -- the caller should keep exploring in that case.
-        """
-        if face == target_face:
-            self._pending_target = None
-            return True, f'Already showing face {target_face}; nothing to do.'
-        path = self._map.known_path(face, target_face)
-        if path is None:
-            return None
-        self._pending_target = target_face
-        message = self._describe_sequence(face, target_face, path)
-        self._log.info(message)
-        return True, message
-
     # ------------------------------------------------------------------ #
-    # Interactive: plan (>= 0, <= 1 physical roll), then execute on OK    #
+    # Interactive: plan (at most 1 physical roll, only if not already    #
+    # calibrated -- see module docstring), then execute on OK             #
     # ------------------------------------------------------------------ #
     def plan_target_face(self, target_face: int) -> Tuple[bool, str]:
         """
-        Identify the die, then report the minimal known roll sequence towards ``target_face``.
+        Identify the die and report the complete minimal roll sequence to ``target_face``.
 
-        Does **at most one** physical roll -- only if a full path to
-        ``target_face`` is not known yet -- purely to learn one more
-        (face, move) transition, never to actually make progress towards
-        the target by trial and error. Never executes the sequence
-        itself: call ``execute_planned_sequence()`` separately once
-        you've looked at the result.
+        Rolls physically at most once, and only if the tracked
+        orientation is missing or no longer matches the live face (see
+        the module docstring's "Calibration") -- never again afterwards
+        while it keeps matching. Call ``execute_planned_sequence()``
+        separately to actually run the reported sequence.
         """
         if not 1 <= target_face <= 6:
             return False, f'invalid target_face={target_face} (must be 1-6)'
 
-        face = self._identify()
+        face = self._identify_face()
         if face is None:
             return False, 'dice identification failed'
 
-        result = self._report_if_known(face, target_face)
-        if result is not None:
-            return result
+        if self._orientation is None or self._orientation.up_face != face:
+            face, err = self._calibrate(face)
+            if face is None:
+                self._pending_target = None
+                return False, err
 
-        move = self._map.plan_next(face, target_face)
-        if move is None:
-            return False, f'no feasible roll known from face {face}'
-        axis, angle = move
-        self._log.info(
-            f'Sequence to face {target_face} not known yet from face {face}; '
-            f'exploratory roll: axis={axis} {angle:+.0f} deg.')
-
-        outcome, message = self._try_roll(face, move)
-        if outcome == 'hard':
-            return False, message
-        if outcome == 'ok':
-            new_face = self._identify()
-            if new_face is None:
-                return False, 'post-roll dice identification failed'
-            self._map.record(face, move, new_face)
-            face = new_face
-        else:
-            recovered = self._identify()
-            if recovered is None:
-                return False, (f'pick_rotate_place failed ({message}) and could '
-                               f'not re-identify the dice afterwards')
+        sequence = plan_min_sequence(self._orientation, target_face, blocked=self._blocked)
+        if sequence is None:
             self._pending_target = None
-            return True, (
-                f'The exploratory roll failed ({message}), so nothing new was '
-                f'learned (still showing face {recovered}); this is a motion/robot '
-                f'issue, not a planning one -- call ~/plan_target_face again to '
-                f'retry it.')
+            return False, (f'no feasible roll sequence found from face {face} to '
+                           f'{target_face} (every candidate blocked at every reachable '
+                           f'orientation -- a robot/kinematics limitation, not a planning one)')
 
-        result = self._report_if_known(face, target_face)
-        if result is not None:
-            return result
-
-        self._pending_target = None
-        self._log.info(self._map.describe())
-        return True, (
-            f'Explored one roll (now showing face {face}); sequence to face '
-            f'{target_face} not fully known yet -- call ~/plan_target_face '
-            f'again to explore further.')
+        self._pending_target = target_face
+        message = self._describe_sequence(face, target_face, sequence)
+        self._log.info(message)
+        return True, message
 
     def execute_planned_sequence(self) -> Tuple[bool, str]:
         """
         Run the sequence ``plan_target_face()`` last reported, roll by roll.
 
-        Re-derives the sequence fresh from the die's *live* face right
-        before executing (cheap, and correct regardless -- see
-        ``dice_face_map``) rather than trusting a possibly-stale stored
-        plan; if nothing changed since ``plan_target_face()`` this is the
-        exact same sequence. Stops at the first roll that does not
-        succeed and reports how far it got.
+        Re-derives the sequence fresh from the die's *live* orientation
+        right before executing (cheap -- a BFS over at most 24 states --
+        and correct regardless of anything that happened since
+        ``plan_target_face()``), and re-derives the tracked orientation
+        again after every single roll via ``from_two_faces()`` (exact,
+        not a prediction -- see the module docstring). If the tracked
+        orientation is stale when this is called (e.g. the die was moved
+        since ``plan_target_face()``), this does **not** silently spend a
+        calibration roll -- it fails and asks for ``~/plan_target_face``
+        again, so a caller reviewing the plan before running it is never
+        surprised by an extra, unplanned roll. Stops at the first roll
+        that does not succeed and reports how far it got.
         """
         if self._pending_target is None:
             return False, 'no plan pending; call ~/plan_target_face first'
         target = self._pending_target
 
-        face = self._identify()
+        face = self._identify_face()
         if face is None:
             return False, 'dice identification failed'
+        if self._orientation is None or self._orientation.up_face != face:
+            self._pending_target = None
+            return False, ('tracked die orientation is stale (observed face does not '
+                           'match); call ~/plan_target_face again to recalibrate')
         if face == target:
             self._pending_target = None
             return True, f'Already showing face {target}.'
 
-        sequence = self._map.known_path(face, target)
+        sequence = plan_min_sequence(self._orientation, target, blocked=self._blocked)
         if not sequence:
             self._pending_target = None
-            return False, (f'no known sequence to reach face {target} from face '
-                           f'{face} anymore; call ~/plan_target_face again')
+            return False, (f'no feasible roll sequence to reach face {target} from face '
+                           f'{face}; call ~/plan_target_face again')
 
+        total = len(sequence)
         for i, move in enumerate(sequence, start=1):
             axis, angle = move
-            self._log.info(f'[{i}/{len(sequence)}] rolling axis={axis} {angle:+.0f} deg')
-            outcome, message = self._try_roll(face, move)
+            self._log.info(f'[{i}/{total}] rolling axis={axis} {angle:+.0f} deg')
+            outcome, message = self._try_roll(self._orientation, move)
             if outcome != 'ok':
-                self._identify()  # best-effort, just to leave the map up to date
+                self._orientation = None  # stale -- next call must recalibrate
+                self._identify_face()  # best-effort, just to leave state current
                 self._pending_target = None
                 return False, (f'sequence execution stopped after {i - 1} successful '
                                f'roll(s): {message}')
 
-            new_face = self._identify()
+            new_face = self._identify_face()
             if new_face is None:
+                self._orientation = None
                 self._pending_target = None
                 return False, 'post-roll dice identification failed'
-            self._map.record(face, move, new_face)
+            self._orientation = DiceOrientation.from_two_faces(face, move, new_face)
             face = new_face
 
         self._pending_target = None
         if face == target:
-            return True, f'Target face {target} reached in {len(sequence)} roll(s).'
-        return False, (f'sequence completed but face is {face}, expected {target} '
-                       f'(die may have settled differently than predicted)')
+            return True, f'Target face {target} reached in {total} roll(s).'
+        return False, (f'sequence completed but face is {face}, expected '
+                       f'{target} (die may have settled differently than predicted)')
 
     # ------------------------------------------------------------------ #
     # State machine                                                       #
@@ -430,9 +482,24 @@ class DiceTaskOrchestrator:
 
         while True:
             if state == State.IDENTIFY:
-                face = self._identify()
-                state = State.FAILED if face is None else State.CHECK_TARGET
-                fail_reason = 'initial dice identification failed'
+                face = self._identify_face()
+                if face is None:
+                    state = State.FAILED
+                    fail_reason = 'dice identification failed'
+                elif self._orientation is None or self._orientation.up_face != face:
+                    state = State.CALIBRATE
+                else:
+                    state = State.CHECK_TARGET
+
+            elif state == State.CALIBRATE:
+                new_face, err = self._calibrate(face)
+                if new_face is None:
+                    state = State.FAILED
+                    fail_reason = err
+                else:
+                    attempts += 1
+                    face = new_face
+                    state = State.CHECK_TARGET
 
             elif state == State.CHECK_TARGET:
                 if face == target_face:
@@ -444,20 +511,22 @@ class DiceTaskOrchestrator:
                     state = State.PLAN
 
             elif state == State.PLAN:
-                move = self._map.plan_next(face, target_face)
-                if move is None:
+                sequence = plan_min_sequence(self._orientation, target_face, blocked=self._blocked)
+                if not sequence:
                     state = State.FAILED
                     fail_reason = f'no feasible roll known from face {face}'
                 else:
+                    move = sequence[0]
                     attempts += 1
                     axis, angle = move
                     self._log.info(
                         f'[attempt {attempts}/{self.max_attempts}] face {face} -> '
-                        f'target {target_face}: rolling axis={axis} {angle:+.0f} deg')
+                        f'target {target_face}: rolling axis={axis} {angle:+.0f} deg '
+                        f'(minimal sequence has {len(sequence)} roll(s))')
                     state = State.ROLL
 
             elif state == State.ROLL:
-                outcome, message = self._try_roll(face, move)
+                outcome, message = self._try_roll(self._orientation, move)
                 if outcome == 'hard':
                     state = State.FAILED
                     fail_reason = message
@@ -466,24 +535,21 @@ class DiceTaskOrchestrator:
                     state = State.VERIFY
                     continue
 
-                # 'recoverable'
-                recovered = self._identify()
-                if recovered is None:
-                    state = State.FAILED
-                    fail_reason = (f'pick_rotate_place failed ({message}) and could not '
-                                   f're-identify the dice afterwards')
-                    continue
-                face = recovered
-                state = State.CHECK_TARGET  # re-plan from the (possibly unchanged) real face
+                # 'recoverable' -- tracked orientation may no longer be
+                # valid (the die could have ended up anywhere); force a
+                # fresh IDENTIFY (and recalibration if needed) rather
+                # than assuming it is still correct.
+                self._orientation = None
+                state = State.IDENTIFY
 
             elif state == State.VERIFY:
-                new_face = self._identify()
+                new_face = self._identify_face()
                 if new_face is None:
                     state = State.FAILED
                     fail_reason = 'post-roll dice identification failed'
                     continue
-                self._map.record(face, move, new_face)
-                self._log.info(self._map.describe())
+                self._orientation = DiceOrientation.from_two_faces(face, move, new_face)
+                self._log.info(f'Now: {self._orientation.describe()}')
                 face = new_face
                 state = State.CHECK_TARGET
 
@@ -492,22 +558,22 @@ class DiceTaskOrchestrator:
 
             elif state == State.FAILED:
                 self._log.error(fail_reason)
-                self._log.info(self._map.describe())
                 return False, fail_reason
 
 
 def _declare_parameters(node: Node) -> None:
     node.declare_parameter('target_face', 0)  # 0 = unset / invalid
-    # Every roll is a 90 deg turn about a fixed WORLD axis, learned online
-    # by dice_face_map (with its opposite-pair shortcut cutting this down
-    # a lot in practice). Only 2 candidate rolls are used on this cell
-    # (see dice_face_map.CANDIDATE_ROLLS), so exploration is less
-    # efficient than with more/body-relative candidates: verified offline
-    # with a full physical-cube model, 300 random targets, 0 failures,
-    # average ~5 rolls/target once warmed up, worst case (a first-ever
-    # request, cold) 31 rolls. 50 leaves real margin above that; lower it
-    # once re-verified against the real robot/simulator.
-    node.declare_parameter('max_attempts', 50)
+    # Every roll is a 90 deg turn about a fixed WORLD axis. Once the die's
+    # full orientation is known (at most 1 calibration roll, see the
+    # module docstring), reaching any target from any start takes at most
+    # 3 more rolls (proven by BFS over the reachable orientation graph,
+    # see test_dice_face_map.py) -- so 4 total, worst case, per request.
+    # Kept generous anyway: a blocked roll (see _blocked) can force a
+    # longer detour, and a 'recoverable' failure forces a re-IDENTIFY
+    # (and possibly a re-calibration roll) without making progress. This
+    # bounds runaway retries on a persistently misbehaving cell, not
+    # normal operation.
+    node.declare_parameter('max_attempts', 15)
     node.declare_parameter('manipulation_node_name', 'dice_manipulation_node')
     node.declare_parameter('dice_identification_service', 'dice_identification')
     node.declare_parameter('run_on_start', False)

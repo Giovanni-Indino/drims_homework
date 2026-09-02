@@ -54,13 +54,14 @@ dice_manipulation_node:
     # trusting it near a physical barrier.
     release_position: [1.0, 0.6]
 
-    # Yaw the gripper's opening axis to line up exactly with roll_axis
-    # before rolling, so the jaws are always exactly horizontal at
-    # release (see dice_manipulation_node's module docstring, "Why align
-    # the grip axis"). Disable only if this extra motion itself causes
-    # planning failures.
-    align_grip_before_roll: true
-    align_tolerance_deg: 1.0
+    # Note: there used to be an align_grip_before_roll/align_tolerance_deg
+    # pair here, for a post-lift yaw that squared the gripper's jaws to
+    # roll_axis. Removed: that yaw rigidly carried the die with it (a
+    # world-Z rotation of the die itself), which is exactly what made the
+    # die's orientation unpredictable in closed form -- see
+    # dice_face_map's module docstring. The jaw-squaring now happens
+    # *before* the grasp instead (dice_manipulation_node.grasp_orientation()),
+    # so it never touches the die and there is nothing left to tune here.
 
     # --- Roll applied to the held dice, near the table ------------------
     # Rotates the die by roll_angle_deg about a FIXED WORLD axis ('x' or

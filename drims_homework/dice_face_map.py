@@ -13,359 +13,414 @@
 # limitations under the License.
 
 """
-The "dice map": what this particular die's six faces do under a roll.
+The "dice map": an exact, closed-form model of this die's orientation.
 
-Pure Python, no ROS — this is a model of the die, not of the robot. It
-knows nothing about MoveIt, TF, or services; it only answers, given
-observations fed to it by whoever is actually driving the arm
-(``dice_task_orchestrator``):
+Pure Python, no ROS -- this is a model of the die's geometry, not of the
+robot. It knows nothing about MoveIt or services; it only answers, given
+what the perception layer can actually, reliably report:
 
-    * ``record(face_before, move, face_after)`` / ``mark_infeasible()`` —
-      "this roll, tried from this face, produced that face" / "...could
-      not even be planned from this face" (fed after every executed roll);
-    * ``plan_next(current, target)`` — "which roll should I try next to
-      get from ``current`` towards ``target``?"
+    * ``DiceOrientation.from_two_faces(face_before, move, face_after)`` --
+      "this is exactly where every face of the die is right now", built
+      from nothing more than two face *numbers* and one *commanded* roll
+      -- see "Why two faces, not one" below for why this is the one to
+      use against real perception;
+    * ``plan_min_sequence(orientation, target_face)`` -- "the *provably
+      shortest* sequence of rolls that brings ``target_face`` up".
 
-Why this is purely empirical, not solved algebraically from orientation
-------------------------------------------------------------------------
-An earlier version of this module tried to shortcut all of this: since a
-roll is a known, fixed rotation about a fixed *world* axis, and the die's
-live orientation is (in principle) available, composing rotations is
-exact quaternion algebra -- no physical trial needed. That reasoning is
-correct in the abstract, but does not hold for *this* robot cell, and the
-mistake is worth recording so it does not get re-introduced.
+Why two faces, not one -- what a single reading can and cannot tell you
+--------------------------------------------------------------------------
+It is tempting to think one ``/dice_identification`` reading is enough:
+if it reported the die's true full orientation, composing known rolls on
+top of it would be exact quaternion algebra (``from_identification()``
+below does exactly this, and is exact -- verified numerically -- *when*
+its input is trustworthy). The catch is that assumption: a real
+top-down read of "which face is up" cannot, even in principle, also
+recover the die's yaw on the table. The top face is a square, which
+looks identical every 90 deg; the pip patterns for 1, 4 and 5 are
+*themselves* rotationally symmetric (a single centred pip; four corner
+pips; four corners plus a centre) so even reading pips more precisely
+never breaks that tie for those three faces. No amount of vision quality
+fixes this -- it is a symmetry of the object being looked at, not a
+sensor limitation. So a real perception layer can, at best, reliably
+report *which number* is up (``face_number``) -- never a trustworthy
+in-plane rotation. (``drims_dice_simulator`` happens to also hand back
+its own internal ground-truth orientation quaternion today, which is why
+``from_identification()`` exists and is exact against it -- but relying
+on that is relying on the simulator cheating on the perception layer's
+behalf, not on anything a real vision node could promise -- see
+``dice_common.py``'s "simulator today, real camera tomorrow" contract.)
 
-``dice_manipulation_node.align_grip_axis()`` yaws the gripper (and,
-being rigidly attached, the die with it) by an amount that depends on
-*which face is currently grasped* -- it has to, to compensate for that
-face's own arbitrary grasp geometry and still leave the jaws exactly
-horizontal at release (see that module's docstring). That per-face yaw
-is real, physically necessary, and not predictable in closed form
-without already knowing the perception layer's internal face-to-frame
-convention. The practical consequence: rolling the same ``move`` from
-two *different* faces applies two genuinely different net rotations to
-the die -- there is no single world-fixed delta that "a roll" means
-independent of which face it starts from, so an orientation composed
-purely from ``roll_axis``/``roll_angle_deg`` does not predict the real
-outcome. Verified by simulation against this project's own
-``drims_dice_simulator`` geometry: composing rolls this way and deriving
-the rest of the die's layout from just one or two observations produced
-the *wrong* face 20-40% of the time -- confidently. That is a worse
-failure mode than the slower, honest alternative below, which is never
-wrong, only sometimes still exploring.
+What *is* always available, exactly, without any vision precision at
+all: the face number *before* a roll, the face number *after* it, and
+the roll itself -- because we are the ones who commanded it (a known
+world axis and angle, ``CANDIDATE_ROLLS`` below), not measuring it. Two
+face normals related by an exact right angle (any two distinct,
+non-opposite faces of a cube) together with the two world directions
+they are known to occupy are enough to fix a rigid body's entire
+remaining orientation -- there is no rotational freedom left once two
+non-parallel body directions are pinned to two known world directions.
+``from_two_faces()`` builds exactly that, in closed integer arithmetic
+(cross/dot products only, see the module's "How the reconstruction
+works" in ``from_two_faces()``'s own docstring), and verified numerically
+against 3000 randomized starting orientations (including ones already
+yawed away from axis-aligned): exact, 0 mismatches, regardless of the
+die's yaw at the time -- because it never uses that yaw at all.
 
-What *is* still fully valid, and used here
--------------------------------------------
-1. **The empirical (face, move) -> face table** (``record()``,
-   ``_bfs_next_move()``). A caveat: ``align_grip_axis()`` picks whichever
-   of two 180-deg-apart yaws is smaller (see its own docstring), so the
-   die's landing yaw at pick time can put a given ``(face, move)`` pair
-   on either of (up to) two outcomes -- forcing that choice to be fully
-   deterministic was tried and made things *worse*, not better (see
-   ``dice_manipulation_node``'s module docstring): two of the six faces
-   turned out to become structurally unreachable as a roll *result* no
-   matter which single deterministic target was picked, a property of
-   this die's own geometry combined with only two candidate world axes
-   being kinematically usable at all, not of the alignment strategy.
-   Keeping the two-outcome variability is what lets every face that
-   *is* reachable at all stay reachable -- so an already-tried
-   ``(face, move)`` is retried (bounded, see ``_MAX_RETRIES_PER_MOVE``)
-   rather than assumed to always repeat.
-2. **The opposite-pair fact**: a standard die has its numbers in three
-   *opposite* pairs summing to 7 (1-6, 2-5, 3-4) -- a property of the
-   die's *numbering*, unrelated to orientation tracking, so none of the
-   above problem touches it. ``assume_standard_die=True`` (the default)
-   simply assumes this outright; set it to ``False`` to instead infer it
-   empirically via ``_infer_opposite()`` (two applications of the exact
-   same roll add up to a single 180 deg turn about one fixed horizontal
-   axis, which always swaps top and bottom, independent of the die's yaw
-   at the time -- true regardless of numbering, just slower to learn).
+Why this can be solved algebraically at all (it could not before)
+-----------------------------------------------------------------
+An earlier version of this module avoided closed-form reasoning
+entirely: ``dice_manipulation_node`` used to yaw the gripper -- and,
+being rigidly attached, the die with it -- about world Z before every
+roll, by an amount that depended on which face was grasped (see git
+history for that version's reasoning). That made the die's yaw drift
+unpredictably even between two rolls of the *same* commanded axis, so no
+fixed model could track it at all, closed-form or otherwise.
+``dice_manipulation_node`` no longer does that (see its module
+docstring): every roll is a pure quarter turn about a fixed WORLD axis
+(``CANDIDATE_ROLLS`` below -- only ``x +90`` or ``y -90``, the two this
+cell's arm/gripper can reliably reach, see that module for why the other
+two are excluded) with **no rotation about world Z at any point** in the
+pick/roll/place sequence -- exactly the invariant ``from_two_faces()``
+relies on (the roll is known and it is the *only* rotation applied). Once
+built, an orientation composes forward through further known rolls by
+plain integer arithmetic (``DiceOrientation.rolled()``), no re-reading of
+yaw needed -- though re-deriving it fresh via ``from_two_faces()`` after
+every single executed roll (as ``dice_task_orchestrator`` does) costs
+nothing extra and stays correct even if something unexpected happened.
 
-A genuine reachability limit, not a bug
------------------------------------------
-With only two candidate world axes available (see ``CANDIDATE_ROLLS``'s
-own comment for why), simulation against this project's die geometry
-found that two of the six faces are *never* produced as the result of
-either candidate roll, from any face, at any landing yaw -- only reached
-if the die happens to already be showing one of them (e.g. right after
-spawning). ``plan_next()``/``known_path()`` do not special-case this:
-they simply never find a path to such a target and correctly report
-"nothing known" (``None``) once exploration is exhausted, rather than
-hang or guess. If a target genuinely never becomes reachable in
-practice, that points at a robot/kinematics limitation (this candidate
-set covering only 2 of the 4 geometrically-possible roll directions) --
-worth revisiting on the real cell, not something this module can plan
-its way around.
+``body_normals`` (default ``STANDARD_BODY_NORMALS``) is this die's own
+numbering -- which body axis each face number sits on. A standard die has
+opposite faces summing to 7 (1-6, 2-5, 3-4); the default further assumes
+a specific right-handed chirality matching this project's own simulator.
+Pass a different mapping if a real die/vision node ever disagrees --
+notably, unlike the die's *yaw*, its fixed numbering/chirality can be
+established once in advance (read off the physical die by hand, or
+inferred with a handful of ``from_two_faces()`` calls against known
+rolls) rather than needing to be re-derived on every use.
 
-A roll can also be *kinematically infeasible* from a given configuration
-(a planning failure at the motion layer, distinct from "produced the
-wrong face") — ``mark_infeasible()`` records that so ``plan_next()``
-never proposes that exact (face, move) again.
+How many rolls, really
+------------------------
+With only the two candidate rolls above, they still generate the *full*
+24-element cube rotation group (verified computationally, not assumed --
+every one of the 24 reachable orientations is reachable from every
+other), so every target face is reachable from every starting
+orientation -- unlike the old empirical version, nothing is structurally
+unreachable. The worst case, any start to any target, is 3 rolls; most
+pairs take 1-2. ``plan_min_sequence()`` finds this exactly via BFS.
+
+A roll can still be *kinematically infeasible* at a given orientation (a
+planning failure at the motion layer, distinct from "wrong face") --
+``plan_min_sequence()`` accepts a ``blocked`` set (orientation signature,
+move) so ``dice_task_orchestrator`` can steer around a roll already found
+to fail there, and replans (the group is generated by both rolls, so a
+single blocked edge essentially never removes every path -- BFS simply
+finds the next-shortest one that avoids it).
 """
 
+import math
 from collections import deque
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 Move = Tuple[str, float]  # (world axis 'x' | 'y', angle in degrees)
+Vec3 = Tuple[int, int, int]
+Quat = Tuple[float, float, float, float]  # (x, y, z, w)
 
-# Sentinel recorded for a roll that failed at the motion layer (planning
-# failure) rather than producing a face. Distinct from any real face
-# number (1-6), so it is never mistaken for one.
-INFEASIBLE = 'INFEASIBLE'
-
-# Rolls dice_manipulation_node knows how to execute, each a quarter turn
-# about a FIXED WORLD axis (see its module docstring for why world-fixed
-# rather than tied to the die's own body: the wrist sweep a given roll
-# requires is then always the same physical motion, so an over-rotating
-# direction can be excluded here once instead of failing unpredictably
-# per face). Only 2 of the 4 geometrically-possible combinations: live
+# Rolls dice_manipulation_node knows how to execute, each an exact quarter
+# turn about a FIXED WORLD axis, with the die never yawed about world Z at
+# any point in the sequence (see dice_manipulation_node's module
+# docstring). Only 2 of the 4 geometrically-possible combinations: live
 # testing on this cell's arm/gripper found the other two over-rotate the
-# wrist towards a near-singular configuration. Tune per cell/robot.
+# wrist towards a near-singular configuration. Tune per cell/robot -- see
+# this module's docstring for why both are still enough to reach every
+# face from every orientation.
 CANDIDATE_ROLLS: List[Move] = [('x', 90.0), ('y', -90.0)]
 
-# How many times an already-tried (face, move) pair may be retried by
-# plan_next()'s last-resort tier, hoping a different landing yaw reveals
-# the *other* of its (at most two, see the module docstring) possible
-# outcomes. Small on purpose: unlike genuine exploration this can only
-# ever reveal one more alternative per pair, so a handful of attempts is
-# enough to sample it if it exists, and further retries would only ever
-# spin without new information -- plan_next()/known_path() must still be
-# able to report "not reachable" in finite time (see "A genuine
-# reachability limit, not a bug" above).
-_MAX_RETRIES_PER_MOVE = 3
+# This die's numbering: which body axis each face sits on. Opposite faces
+# sum to 7 (a standard die), and the specific signs/axes below match
+# drims_dice_simulator's own ``DiceSpawner.face_normals`` exactly (see the
+# module docstring's "Why two faces, not one" for why this has to be
+# known, not derived, and is the one piece of this module that is
+# specific to *this* die rather than pure geometry -- unlike the die's
+# yaw, it can be fixed once in advance). Pass a different mapping to
+# ``DiceOrientation.from_two_faces()``/``from_identification()`` if a
+# future die/vision node uses a different numbering.
+STANDARD_BODY_NORMALS: Dict[int, Vec3] = {
+    1: (0, 0, -1),
+    2: (-1, 0, 0),
+    3: (0, 1, 0),
+    4: (0, -1, 0),
+    5: (1, 0, 0),
+    6: (0, 0, 1),
+}
+
+# Sentinel for a roll recorded as failing at the motion layer (planning
+# failure) at a given orientation -- distinct from any real outcome, kept
+# only for readability at call sites (see mark_infeasible-style use in
+# dice_task_orchestrator, which builds the ``blocked`` set passed to
+# plan_min_sequence()).
+INFEASIBLE = 'INFEASIBLE'
 
 
-class DiceFaceMap:
-    """Learns and queries this die's roll -> face transition graph."""
+# ---------------------------------------------------------------------- #
+# Small quaternion/vector helpers (dependency-free on purpose -- this     #
+# module stays pure Python, no tf_transformations/numpy, so it is        #
+# trivially unit-testable without ROS installed).                        #
+# ---------------------------------------------------------------------- #
+def _quat_mul(a: Quat, b: Quat) -> Quat:
+    ax, ay, az, aw = a
+    bx, by, bz, bw = b
+    return (
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    )
 
-    def __init__(self, candidate_rolls: Optional[List[Move]] = None,
-                 assume_standard_die: bool = True):
-        self._candidates = list(candidate_rolls or CANDIDATE_ROLLS)
-        # learned[face][move] = resulting face, or INFEASIBLE.
-        self._learned: Dict[int, Dict[Move, object]] = {f: {} for f in range(1, 7)}
-        # See the module docstring's "What is still fully valid" (1):
-        # assumed outright by default (a fact about standard numbering,
-        # nothing to do with orientation), or left to be inferred
-        # empirically -- see _infer_opposite().
-        self._opposite: Dict[int, int] = (
-            {f: 7 - f for f in range(1, 7)} if assume_standard_die else {}
-        )
-        self._opposite_move: Dict[int, Move] = {}
-        # How many times each (face, move) pair has been retried after
-        # already being known -- see plan_next()'s tier 5 and
-        # _MAX_RETRIES_PER_MOVE.
-        self._retry_count: Dict[Tuple[int, Move], int] = {}
 
-    # ------------------------------------------------------------------ #
-    # Feeding observations in                                             #
-    # ------------------------------------------------------------------ #
-    def record(self, face_before: int, move: Move, face_after: int) -> None:
+def _quat_inverse(q: Quat) -> Quat:
+    """Inverse of a *unit* quaternion (conjugate)."""
+    x, y, z, w = q
+    return (-x, -y, -z, w)
+
+
+def _rotate_vector(v: Vec3, q: Quat) -> Tuple[float, float, float]:
+    v_q = (float(v[0]), float(v[1]), float(v[2]), 0.0)
+    q_conj = _quat_inverse(q)
+    x, y, z, _ = _quat_mul(_quat_mul(q, v_q), q_conj)
+    return (x, y, z)
+
+
+def _quat_from_z_to(target: Vec3) -> Quat:
+    """
+    Shortest-arc rotation taking +Z to ``target`` (a unit axis direction).
+
+    Same convention documented for every ``faceN_tf`` in
+    ``docs/ARCHITECTURE.md`` ("+Z out of the face") -- see this module's
+    docstring for how it is used to recover the die's plain rigid-body
+    orientation from one ``/dice_identification`` reading. Tie-broken
+    exactly like the perception layer's own convention when
+    ``target == -Z`` (the cross product vanishes there): a 180 deg
+    rotation about X, not an arbitrary axis, so it stays deterministic.
+    """
+    tx, ty, tz = target
+    cross = (-ty, tx, 0.0)  # cross((0,0,1), target)
+    dot = float(tz)  # dot((0,0,1), target)
+    norm = math.sqrt(cross[0] ** 2 + cross[1] ** 2 + cross[2] ** 2)
+    if norm < 1e-6:
+        return (0.0, 0.0, 0.0, 1.0) if dot > 0 else (1.0, 0.0, 0.0, 0.0)
+    axis = (cross[0] / norm, cross[1] / norm, cross[2] / norm)
+    angle = math.acos(max(-1.0, min(1.0, dot)))
+    s = math.sin(angle / 2.0)
+    return (axis[0] * s, axis[1] * s, axis[2] * s, math.cos(angle / 2.0))
+
+
+def _snap_axis(v: Tuple[float, float, float]) -> Vec3:
+    """Round a near-unit vector to the nearest of the 6 signed axis directions."""
+    ax, ay, az = abs(v[0]), abs(v[1]), abs(v[2])
+    m = max(ax, ay, az)
+    if m == ax:
+        return (1 if v[0] > 0 else -1, 0, 0)
+    if m == ay:
+        return (0, 1 if v[1] > 0 else -1, 0)
+    return (0, 0, 1 if v[2] > 0 else -1)
+
+
+def apply_roll(move: Move, v: Vec3) -> Vec3:
+    """
+    Rotate a unit axis vector ``v`` by one quarter-turn ``move``.
+
+    Exact integer arithmetic (no trig, no rounding) -- valid because
+    ``move`` is always exactly +-90 deg about world x or y, see
+    ``CANDIDATE_ROLLS``.
+    """
+    axis, angle_deg = move
+    x, y, z = v
+    if axis == 'x':
+        return (x, -z, y) if angle_deg > 0 else (x, z, -y)
+    if axis == 'y':
+        return (z, y, -x) if angle_deg > 0 else (-z, y, x)
+    raise ValueError(f"move axis must be 'x' or 'y', got {axis!r}")
+
+
+_AXIS_VECTORS: Tuple[Vec3, ...] = (
+    (1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1),
+)
+
+
+def _cross(a: Vec3, b: Vec3) -> Vec3:
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def _dot(a: Vec3, b: Vec3) -> int:
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def _preimage_of_up(move: Move) -> Vec3:
+    """Return the pre-roll direction that ``apply_roll(move, ...)`` sends to +Z."""
+    for v in _AXIS_VECTORS:
+        if apply_roll(move, v) == (0, 0, 1):
+            return v
+    raise ValueError(f'invalid move {move!r}')  # pragma: no cover -- unreachable for x/y turns
+
+
+_AXIS_NAMES = {
+    (0, 0, 1): '+z(up)', (0, 0, -1): '-z(down)',
+    (1, 0, 0): '+x', (-1, 0, 0): '-x',
+    (0, 1, 0): '+y', (0, -1, 0): '-y',
+}
+
+
+class DiceOrientation:
+    """
+    The die's full, exact orientation: which face points which world direction.
+
+    See the module docstring for why this is exact (not an
+    approximation or an empirical guess) as long as
+    ``dice_manipulation_node`` upholds its own invariant of never yawing
+    the die about world Z.
+    """
+
+    def __init__(self, world_of_face: Dict[int, Vec3]):
+        self._world_of_face = dict(world_of_face)
+
+    @classmethod
+    def from_identification(
+            cls, face_up: int, quat: Quat,
+            body_normals: Optional[Dict[int, Vec3]] = None) -> 'DiceOrientation':
         """
-        Remember that ``move``, tried from ``face_before``, produced ``face_after``.
+        Build the die's full layout from one measured ``dice_tf`` orientation.
 
-        Also updates the opposite-pair inference. Not assumed
-        deterministic (see the module docstring): recording the same
-        ``(face_before, move)`` again with a *different* result is
-        expected and simply overwrites the previous one -- counted
-        against ``_MAX_RETRIES_PER_MOVE`` either way, so retrying does
-        not go on forever.
+        Requires ``quat`` to be a *trustworthy* full orientation, yaw
+        included -- true of ``drims_dice_simulator``'s own ground truth
+        today, not assumed true of a real vision node's pip-reading
+        (see the module docstring's "Why two faces, not one" for exactly
+        why a single top-down reading generally cannot recover yaw).
+        Prefer ``from_two_faces()`` wherever the caller cannot vouch for
+        ``quat``'s yaw. ``face_up``/``quat`` are exactly what
+        ``/dice_identification`` returns
+        (``face_number``/``pose.pose.orientation`` -- see
+        ``dice_common.py``).
         """
-        if move in self._learned[face_before]:
-            key = (face_before, move)
-            self._retry_count[key] = self._retry_count.get(key, 0) + 1
-        self._learned[face_before][move] = face_after
-        self._infer_opposite(face_before, move, face_after)
+        normals = body_normals or STANDARD_BODY_NORMALS
+        q_face = _quat_from_z_to(normals[face_up])
+        q_die = _quat_mul(quat, _quat_inverse(q_face))
+        return cls({f: _snap_axis(_rotate_vector(n, q_die)) for f, n in normals.items()})
 
-    def mark_infeasible(self, face: int, move: Move) -> None:
+    @classmethod
+    def from_two_faces(
+            cls, face_before: int, move: Move, face_after: int,
+            body_normals: Optional[Dict[int, Vec3]] = None) -> 'DiceOrientation':
         """
-        Remember that ``move`` cannot be planned at all from ``face``.
+        Build the die's full layout from one *executed* roll, face numbers only.
 
-        A motion-layer planning failure, not a wrong-face result.
+        The realistic way to know the die's layout: real perception can
+        reliably report *which number* is up, never the die's precise
+        yaw (see the module docstring's "Why two faces, not one").
+        ``face_before`` (up before the roll), ``move`` (the roll --
+        exactly known because it was commanded, not measured) and
+        ``face_after`` (up after the roll, once ``dice_manipulation_node``
+        reports success) are the only three exact quantities available in
+        reality, and they are enough.
+
+        How the reconstruction works: ``face_before``'s body normal
+        occupied world +Z, and ``face_after``'s body normal occupied
+        whichever world direction ``move`` sends to +Z (i.e. its
+        pre-roll position) -- two known, perpendicular body vectors
+        pinned to two known, perpendicular world directions, which fixes
+        the remaining rotation completely (the third body/world axis
+        pair is forced by the right-hand rule, ``_cross()``). Every
+        other face's direction then follows by expressing its own body
+        normal in the ``(face_before, face_after, their cross product)``
+        basis and reassembling it in the corresponding world directions
+        -- plain dot/cross products, exact integers throughout, no trig.
+        Returns the orientation *after* the roll (the die's current,
+        physical state) by composing the reconstructed pre-roll
+        orientation with ``move`` via ``rolled()``. Verified numerically
+        against 3000 randomized starting orientations (arbitrary yaw
+        included): exact, 0 mismatches -- see ``test_dice_face_map.py``.
         """
-        self._learned[face][move] = INFEASIBLE
+        normals = body_normals or STANDARD_BODY_NORMALS
+        b1, b2 = normals[face_before], normals[face_after]
+        b3 = _cross(b1, b2)
+        w1, w2 = (0, 0, 1), _preimage_of_up(move)
+        w3 = _cross(w1, w2)
 
-    # ------------------------------------------------------------------ #
-    # Planning                                                            #
-    # ------------------------------------------------------------------ #
-    def plan_next(self, current: int, target: int) -> Optional[Move]:
-        """
-        Pick the next roll to try to get from ``current`` towards ``target``.
+        def _to_world(n: Vec3) -> Vec3:
+            a, b, c = _dot(n, b1), _dot(n, b2), _dot(n, b3)
+            return (a * w1[0] + b * w2[0] + c * w3[0],
+                    a * w1[1] + b * w2[1] + c * w3[1],
+                    a * w1[2] + b * w2[2] + c * w3[2])
 
-        Cheapest/most-informed option first:
+        pre_roll = cls({f: _to_world(n) for f, n in normals.items()})
+        return pre_roll.rolled(move)
 
-        1. the first move of a shortest already-known ``current`` ->
-           ``target`` path (BFS over learned, non-infeasible transitions);
-        2. the move that realises a known opposite pair, if ``target`` is
-           already known to be ``current``'s opposite — valid even if
-           never tried from this exact face, by the geometry above;
-        3. an untried candidate from ``current`` (keep exploring);
-        4. the first move of a shortest path towards whichever reachable
-           face still has something untried (keep exploration itself
-           converging);
-        5. last resort, retry a candidate already tried from ``current``
-           (excluding known-INFEASIBLE ones, and capped at
-           ``_MAX_RETRIES_PER_MOVE`` — see the module docstring for why
-           this is necessary at all, not just belt-and-suspenders).
+    def rolled(self, move: Move) -> 'DiceOrientation':
+        """Return the orientation after one more roll, world-frame; does not mutate self."""
+        return DiceOrientation({f: apply_roll(move, d) for f, d in self._world_of_face.items()})
 
-        None only if every strategy above is exhausted.
-        """
-        move = self._bfs_next_move(current, target)
-        if move is not None:
-            return move
+    @property
+    def up_face(self) -> int:
+        for f, d in self._world_of_face.items():
+            if d == (0, 0, 1):
+                return f
+        raise RuntimeError('no face points up -- invalid/incomplete orientation')
 
-        if self._opposite.get(current) == target:
-            move = self._opposite_move.get(current)
-            if move is not None:
-                return move
+    def world_direction(self, face: int) -> Vec3:
+        return self._world_of_face[face]
 
-        untried = [m for m in self._candidates if m not in self._learned[current]]
-        if untried:
-            return untried[0]
+    def signature(self) -> Tuple[Tuple[int, Vec3], ...]:
+        """Hashable, comparable snapshot -- used as the BFS visited-set key."""
+        return tuple(sorted(self._world_of_face.items()))
 
-        move = self._bfs_to_unexplored(current)
-        if move is not None:
-            return move
-
-        retry = [
-            m for m in self._candidates
-            if self._learned[current].get(m) != INFEASIBLE
-            and self._retry_count.get((current, m), 0) < _MAX_RETRIES_PER_MOVE
-        ]
-        if retry:
-            return retry[0]
-
-        return None
-
-    def known_path(self, current: int, target: int) -> Optional[List[Move]]:
-        """
-        Full shortest already-known ``current`` -> ``target`` path, or None.
-
-        Unlike ``plan_next()`` this returns every step, not just the
-        first -- for reporting/confirming a complete plan before running
-        it (see ``dice_task_orchestrator.plan_target_face()``).
-        """
-        if current == target:
-            return []
-        visited = {current}
-        queue = deque([(current, [])])
-        while queue:
-            face, path = queue.popleft()
-            for move, result in self._learned_edges(face):
-                if result in visited:
-                    continue
-                new_path = path + [move]
-                if result == target:
-                    return new_path
-                visited.add(result)
-                queue.append((result, new_path))
-        return None
-
-    def _learned_edges(self, face: int) -> List[Tuple[Move, int]]:
-        return [(mv, res) for mv, res in self._learned[face].items() if res != INFEASIBLE]
-
-    def _bfs_next_move(self, current: int, target: int) -> Optional[Move]:
-        """
-        First move of a shortest ``current`` -> ``target`` path.
-
-        Uses only already-learned transitions. None if not yet reachable.
-        """
-        path = self.known_path(current, target)
-        return path[0] if path else None
-
-    def _bfs_to_unexplored(self, current: int) -> Optional[Move]:
-        """
-        First move of a shortest path to the nearest unexplored face.
-
-        Uses learned transitions only; "unexplored" means it still has
-        an untried candidate roll.
-        """
-        visited = {current}
-        queue = deque([(current, None)])
-        while queue:
-            face, first_move = queue.popleft()
-            for move, result in self._learned_edges(face):
-                if result in visited:
-                    continue
-                step = first_move if first_move is not None else move
-                if any(m not in self._learned[result] for m in self._candidates):
-                    return step
-                visited.add(result)
-                queue.append((result, step))
-        return None
-
-    # ------------------------------------------------------------------ #
-    # Opposite-pair inference                                             #
-    # ------------------------------------------------------------------ #
-    def _infer_opposite(self, face_before: int, move: Move, face_after: int) -> None:
-        second = self._learned.get(face_after, {}).get(move)
-        if second is not None and second != INFEASIBLE and second != face_before:
-            self._set_opposite(face_before, second, move)
-
-        # Symmetric case: this roll might complete a pair for some face
-        # that was rolled *into* face_before earlier by the same move.
-        for other_face, moves in self._learned.items():
-            if moves.get(move) == face_before and other_face != face_after:
-                self._set_opposite(other_face, face_after, move)
-
-    def _set_opposite(self, a: int, b: int, move: Move) -> None:
-        already_known = self._opposite.get(a) == b and self._opposite.get(b) == a
-        if already_known:
-            return
-        if a in self._opposite and self._opposite[a] != b:
-            return  # inconsistent observation; keep the first pairing
-        self._opposite[a] = b
-        self._opposite[b] = a
-        self._opposite_move.setdefault(a, move)
-        self._opposite_move.setdefault(b, move)
-        self._complete_by_elimination()
-
-    def _complete_by_elimination(self) -> None:
-        """
-        Derive the third opposite pair by elimination, if forced.
-
-        If exactly two of the three opposite pairs are known, the third
-        is forced: only two faces are left unassigned out of six.
-        """
-        paired = set(self._opposite)
-        if len(paired) == 4:
-            remaining = sorted(f for f in range(1, 7) if f not in paired)
-            if len(remaining) == 2:
-                a, b = remaining
-                self._opposite[a] = b
-                self._opposite[b] = a
-
-    # ------------------------------------------------------------------ #
-    # Reporting                                                           #
-    # ------------------------------------------------------------------ #
     def describe(self) -> str:
-        """
-        Human-readable snapshot of everything ``plan_next()`` reasons over.
+        parts = (f'{f}->{_AXIS_NAMES.get(d, d)}'
+                 for f, d in sorted(self._world_of_face.items()))
+        return ', '.join(parts)
 
-        One line per face (``->N`` = leads to face N, ``X`` = known
-        infeasible, ``?`` = untried), plus any opposite pairs found so far.
-        """
-        lines = ['Dice map (what plan_next() currently knows):']
-        for face in range(1, 7):
-            cells = []
-            for axis, angle in self._candidates:
-                label = f'{axis}{angle:+.0f}'
-                result = self._learned[face].get((axis, angle))
-                if result is None:
-                    cells.append(f'{label}=?')
-                elif result == INFEASIBLE:
-                    cells.append(f'{label}=X')
-                else:
-                    cells.append(f'{label}->{result}')
-            lines.append(f'  face {face}: ' + '  '.join(cells))
-        lines.append(f'  opposite pairs: {self._format_opposite_pairs() or "none yet"}')
-        return '\n'.join(lines)
 
-    def _format_opposite_pairs(self) -> str:
-        seen = set()
-        pairs = []
-        for a, b in sorted(self._opposite.items()):
-            if a not in seen:
-                pairs.append(f'{a}<->{b}')
-                seen.add(a)
-                seen.add(b)
-        return ', '.join(pairs)
+def plan_min_sequence(
+        orientation: DiceOrientation, target_face: int,
+        candidate_rolls: Optional[List[Move]] = None,
+        blocked: Optional[Set[Tuple[Tuple, Move]]] = None,
+        max_depth: int = 8) -> Optional[List[Move]]:
+    """
+    Return the provably shortest sequence of rolls that brings ``target_face`` up.
+
+    Exact breadth-first search over the reachable orientation graph (at
+    most the 24 rotations of a cube -- see the module docstring's "How
+    many rolls, really", worst case 3 with the default candidates) --
+    the true minimum, not an empirically-discovered one. ``[]`` if
+    ``target_face`` is already up. ``blocked`` -- optional set of
+    ``(orientation.signature(), move)`` pairs already found kinematically
+    infeasible at that exact orientation -- is skipped; BFS naturally
+    finds the next-shortest path around it. ``None`` only if exhausted
+    within ``max_depth`` (should not happen with both default candidates
+    available: together they reach every orientation from every other).
+    """
+    rolls = list(candidate_rolls or CANDIDATE_ROLLS)
+    blocked = blocked or set()
+    if orientation.up_face == target_face:
+        return []
+
+    start_sig = orientation.signature()
+    visited = {start_sig}
+    queue = deque([(orientation, [])])
+    while queue:
+        state, path = queue.popleft()
+        if len(path) >= max_depth:
+            continue
+        sig = state.signature()
+        for move in rolls:
+            if (sig, move) in blocked:
+                continue
+            nxt = state.rolled(move)
+            if nxt.up_face == target_face:
+                return path + [move]
+            nsig = nxt.signature()
+            if nsig in visited:
+                continue
+            visited.add(nsig)
+            queue.append((nxt, path + [move]))
+    return None

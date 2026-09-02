@@ -15,20 +15,21 @@ the desired number is up. Everything runs on **ROS 2 (Humble)**.
                      ┌───────────────────────────────────────────┐
                      │        dice_task_orchestrator              │  "smart" layer:
                      │  explicit state machine (State enum)        │  an explicit
-                     │  IDENTIFY → CHECK_TARGET → PLAN → ROLL →    │  state machine
-                     │  VERIFY → (loop) → DONE / FAILED            │  coordinating
-                     └───────┬─────────────────────┬───────────────┘  everything else
+                     │  IDENTIFY → CALIBRATE(if needed) →           │  state machine
+                     │  CHECK_TARGET → PLAN → ROLL → VERIFY →      │  coordinating
+                     │  (loop) → DONE / FAILED                      │  everything else
+                     └───────┬─────────────────────┬───────────────┘
                              │                      │
-                    plan_next()/record()   set_parameters + ~/pick_rotate_place
+              from_two_faces()/plan_min_sequence()  set_parameters + ~/pick_rotate_place
                              │                      │
               ┌──────────────▼──────────┐  ┌────────▼───────────────────────┐
               │      dice_face_map        │  │      dice_manipulation_node    │
-              │  pure-Python model of     │  │  the pick/roll/place SKILL:    │
-              │  THIS die's face layout,  │  │  identify→pick→lift→align→     │
-              │  no ROS, no robot         │  │  roll→release→report           │
+              │  closed-form model of     │  │  the pick/roll/place SKILL:    │
+              │  THIS die's face layout,  │  │  identify→pick(yaw-chosen)→    │
+              │  no ROS, no robot         │  │  lift→roll→release→report      │
               └────────────────────────────┘  └───────┬─────────────────────┘
                              ▲                          │ easy_motion (MoveIt 2)
-                             │ face_number                │ move_to_pose/joint,
+                             │ face_number (only)          │ move_to_pose/joint,
                     ┌────────┴──────────┐                 │ gripper, attach/detach
                     │   dice_common      │                 │
                     │ /dice_identification│                ▼
@@ -64,59 +65,81 @@ service + the same TF frames. Nothing downstream changes.
 ### 2. `dice_manipulation_node.py` — the pick/roll/place *skill*
 
 One service, `~/pick_rotate_place` (`std_srvs/srv/Trigger`): identify →
-pick (grasp aligned with live `dice_tf`) → lift → **align the gripper's
-opening axis to the upcoming roll's world axis** → roll a quarter turn
-about that fixed world axis → release right there → retreat → report
-`face X -> face Y`. It does **not** decide which roll to use — `roll_axis`
-/ `roll_angle_deg` are parameters, normally set by the orchestrator via
-`set_parameters` right before each call.
+pick (grasp aligned with live `dice_tf`, yaw **pre-chosen** for the
+upcoming roll before contact) → lift → roll a quarter turn about a fixed
+world axis (**`x +90°` or `y -90°` only — never `z`**) → release right
+there → retreat → report `face X -> face Y`. It does **not** decide which
+roll to use — `roll_axis` / `roll_angle_deg` are parameters, normally set
+by the orchestrator via `set_parameters` right before each call.
 
 Everything non-obvious about *why* it is built this way (near-the-table
 rolls instead of a round trip through `home_joints`, a world-fixed
-instead of body-relative roll axis, the grip-axis alignment step, why
+instead of body-relative roll axis, the grasp-yaw pre-selection, why
 release never returns to the exact pick spot, why nothing re-reads TF
 mid-sequence) is explained once, in the module's own docstring — read it
 before changing the motion sequence.
 
-**The grip-axis alignment, concretely** (this is what makes the release
-horizontal): a flush top-down grasp must follow the die's actual,
-arbitrary live yaw — real physical grasping, not just a scripted attach.
-A world-fixed roll axis is what live testing found reliable for this
-arm's IK, but combined naively that leaves the jaws tilted at release by
-however much they happened to be off from that axis. Right after lifting
-(safely clear of the table), the node now yaws the tool — a plain,
-well-conditioned wrist rotation — until the jaws line up exactly with
-the roll's axis; from then on they stay exactly aligned through the roll
-(a rotation about an axis leaves that axis fixed), so release is always
-exactly horizontal, exactly, not just approximately.
+**The grasp-yaw pre-selection, concretely** (this is what makes the
+release horizontal, without ever rotating the die itself): a flush
+top-down grasp must follow the die's actual live yaw — real physical
+grasping, not a scripted attach. Because the die is *never* yawed about
+world Z by anything in this sequence, it stays axis-aligned forever, so
+`dice_tf`'s own X/Y axes are always exactly parallel to world X/Y. That
+means the jaws can be brought parallel to the upcoming roll's axis with
+an exact 0° or 90° choice, decided from the already-known live `dice_tf`
+orientation and the already-known `roll_axis` — entirely on paper, before
+the gripper ever touches the die. `pick_dice()` folds this straight into
+the grasp approach pose itself (the gripper is open and clear of the die
+throughout approach/descent), and — because a rotation about an axis
+leaves that axis fixed — the jaws stay exactly aligned with the roll
+axis all the way through the roll to release, exactly, not just
+approximately, at zero extra motion cost.
 
 ### 3. `dice_face_map.py` — the die's own "map" (pure Python, no ROS)
 
-What `dice_manipulation_node` cannot know in advance — which physical
-face a given roll produces from a given starting face — this module
-*learns online* and answers `plan_next(current, target)` with the best
-next roll to try. No ROS, no ``rclpy`` — a small graph-learning class
-over `record()`/`mark_infeasible()` observations, testable on its own
-(`test/test_dice_face_map.py`) without touching a robot or simulator.
+Because the die is never yawed about world Z, its orientation is exact,
+closed-form geometry, not something that has to be learned by trial —
+but a single `/dice_identification` reading is *not* enough on its own:
+real perception can reliably report *which number* is up, never the
+die's precise yaw (a top face is a square, and several pip patterns are
+themselves rotationally symmetric — no vision quality fixes that). What
+**is** always exact: the face number before a roll, the face number
+after it, and the roll itself, since it was *commanded*, not measured.
+Two known, perpendicular body-face normals pinned to two known,
+perpendicular world directions fix a rigid body's entire remaining
+orientation — `DiceOrientation.from_two_faces(face_before, move,
+face_after)` builds exactly that (cross/dot products, `STANDARD_BODY_
+NORMALS` for this die's own numbering), and it is both necessary and
+sufficient: nothing less determines the layout, nothing more is needed.
+From there, `plan_min_sequence(orientation, target_face)` is a plain
+breadth-first search over the reachable orientation graph (at most the
+24 rotations of a cube — the two candidate rolls generate the full
+group, verified in `test/test_dice_face_map.py`) for the *provably
+shortest* roll sequence: worst case 3 more rolls, any face from any
+already-known orientation. No ROS, no `rclpy` — pure vector arithmetic,
+no external dependency, testable entirely on its own.
 
-Uses one purely geometric shortcut, true for any die numbering: two
-applications of the *same* roll are a single 180° turn about a fixed
-horizontal axis, which always swaps top and bottom — so two consecutive
-identical rolls immediately reveal an opposite-face pair, and once two
-of the three pairs are known the third is forced by elimination.
-Everything else is breadth-first search over whatever has actually been
-observed so far.
+A roll can still be *kinematically infeasible* at a given orientation (a
+motion-layer planning failure, distinct from "wrong face"): callers pass
+a `blocked` set of already-failed `(orientation, move)` pairs, and BFS
+simply routes around them.
 
 ### 4. `dice_task_orchestrator.py` — the state machine
 
 `DiceTaskOrchestrator.reach_target_face(target_face)` runs an explicit
-`State` enum machine (`IDENTIFY → CHECK_TARGET → PLAN → ROLL → VERIFY →
-… → DONE/FAILED`, see the module docstring for the full diagram). It
-only ever talks to two contracts: `/dice_identification` (perception)
-and `dice_manipulation_node`'s `set_parameters` + `~/pick_rotate_place`
-(the skill) — never MoveIt/TF/the gripper directly, and never assumes
-the simulator's internal geometry: everything about face transitions
-comes from `dice_face_map`, fed by what the robot actually observed.
+`State` enum machine (`IDENTIFY → CALIBRATE (if needed) → CHECK_TARGET →
+PLAN → ROLL → VERIFY → … → DONE/FAILED`, see the module docstring for
+the full diagram). It only ever talks to two contracts:
+`/dice_identification` (perception, and only ever its `face_number` —
+never its orientation, see point 3 above) and `dice_manipulation_node`'s
+`set_parameters` + `~/pick_rotate_place` (the skill) — never
+MoveIt/TF/the gripper directly. `CALIBRATE` is only entered when the
+tracked orientation is missing or no longer matches the live face (the
+very first call, or after anything that could have desynced it) and
+costs exactly one physical roll; every `VERIFY` step afterwards
+re-derives the full orientation again from `(face, move, new face)` via
+`dice_face_map.DiceOrientation.from_two_faces()` — exact by
+construction, never a prediction that could turn out wrong.
 
 Exposed as service `~/reach_target_face` (`std_srvs/srv/Trigger`) +
 parameter `target_face` (1-6).
@@ -167,12 +190,17 @@ test: `ros2 launch drims_homework dice_manipulation_start.launch.py`
 ## Status
 
 - [x] Perception contract (`dice_common.py`, simulated)
-- [x] Manipulation skill (`dice_manipulation_node.py`): pick, lift, grip-axis
-      alignment, world-axis roll, release, report
-- [x] Die-geometry model (`dice_face_map.py`): online learning + opposite-pair
-      shortcut + BFS planning, unit-tested
-- [x] Orchestrating state machine (`dice_task_orchestrator.py`)
-- [ ] Empirical validation of the new grip-axis alignment step on the real
+- [x] Manipulation skill (`dice_manipulation_node.py`): pick with pre-chosen
+      grasp yaw, lift, world-`x`/`y`-only roll (never `z`), release, report
+- [x] Die-geometry model (`dice_face_map.py`): closed-form orientation from
+      one known roll + two face numbers (`from_two_faces()` -- no reliance
+      on a vision-measured yaw) + BFS-proven-minimal planning, unit-tested
+      (worst case 1 calibration roll + 3 planning rolls, any face from any
+      starting orientation)
+- [x] Orchestrating state machine (`dice_task_orchestrator.py`): calibrates
+      with at most one roll when the tracked layout is missing/stale, then
+      re-derives it exactly (not a prediction) after every further roll
+- [ ] Empirical validation of the new pre-grasp yaw-selection step on the real
       arm/simulator (everything IK-related here has needed at least one
       round of "live testing found X actually fails" — treat this the same
       way until confirmed)

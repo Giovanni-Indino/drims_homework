@@ -19,15 +19,29 @@ Given the dice on the table (localized through ``/dice_identification``,
 see ``dice_common.py``), a single ``~/pick_rotate_place`` call:
 
     1. moves home, opens the gripper, identifies the dice;
-    2. picks it from above, grasp aligned with the live ``dice_tf``;
+    2. picks it from above -- grasp yaw aligned with the live ``dice_tf``
+       *and* pre-rotated (before ever touching the die, see "Why the
+       grasp yaw is picked before grasping" below) so the jaws already
+       line up with the world axis the roll is about to turn around;
     3. lifts it straight up (still attached);
-    4. aligns the gripper's opening axis to the world axis the roll is
-       about to turn around (see "Why align the grip axis" below);
-    5. rolls it a quarter turn about that fixed world axis while, in the
+    4. rolls it a quarter turn about that fixed world axis while, in the
        same move, carrying it to a fixed, known-safe table spot (see "Why
        release always happens at a fixed spot");
-    6. descends and releases right there, retreats;
-    7. re-identifies the dice to report the new face-up number.
+    5. descends and releases right there, retreats;
+    6. re-identifies the dice to report the new face-up number.
+
+Throughout all of this the die is never rotated about world Z, at any
+point, by any amount -- not during the grasp (the yaw that lines the
+jaws up happens before contact, see below), not during the roll (which
+is always exactly about world X or world Y), not at release. This is a
+deliberate invariant, not an incidental property: it is what keeps a
+roll's outcome exact, closed-form, integer arithmetic instead of an
+empirical guess -- see ``dice_face_map``'s module docstring for the
+planning consequence (the die's full six-face layout is known exactly
+from one *executed* roll and the two face numbers around it -- real
+perception cannot promise more than that, see "Why two faces, not one"
+there -- and every subsequent minimal roll sequence is a proven BFS
+minimum, not a discovered one).
 
 The *smart* logic that decides **which** roll gets the die to a desired
 number is intentionally NOT here — that is ``dice_task_orchestrator``,
@@ -55,33 +69,36 @@ always the same physical wrist motion, so a direction that turns out to
 over-rotate the wrist can be permanently excluded once (see
 ``dice_face_map.CANDIDATE_ROLLS``) instead of rediscovered per face.
 
-**Why align the grip axis before rolling.** The gripper must open with
-its jaws horizontal at release, so the dice actually falls/settles
-instead of being released at a tilted angle. The jaws close along the
-tool's local X axis, which — because the grasp itself must stay flush
-with whatever the die's *actual* live yaw happens to be (real physical
-grasping, not just a scripted attach) — starts out at an essentially
-arbitrary horizontal angle, not necessarily aligned with the world roll
-axis. Rolling about a world axis then leaves the jaws tilted out of
-horizontal by however much they were originally off from that axis (0
-only by coincidence). ``align_grip_axis()`` fixes this exactly: right
-after lifting (safely clear of the table), it yaws the tool — a plain,
-well-conditioned wrist rotation, nowhere near the roll's own IK
-difficulty — until the jaws line up exactly with the upcoming roll's
-axis. From then on the jaws stay exactly aligned with that axis through
-the roll (rotating about an axis leaves that same axis fixed), so the
-release is always exactly horizontal. Disable via
-``align_grip_before_roll: false`` if it ever causes its own planning
-failures.
+**Why the grasp yaw is picked before grasping, not after.** The gripper
+must open with its jaws horizontal at release, so the dice actually
+falls/settles instead of being released at a tilted angle -- and since a
+world-axis roll leaves that axis's own line fixed, jaws that start out
+parallel to the *upcoming* roll axis stay exactly parallel to it all the
+way to release. The jaws close along the tool's local X axis, and the
+grasp itself must stay flush with the die's *actual* live yaw (real
+physical grasping, not a scripted attach) -- but because the die is
+always axis-aligned at pick time (see the module docstring's invariant:
+nothing here ever yaws it), ``dice_tf``'s own X/Y axes are *always*
+exactly parallel to world X/Y, never at some arbitrary in-between angle.
+That means the jaws can be brought parallel to either world axis with an
+exact 0 or 90 deg choice, decided from the already-known live ``dice_tf``
+orientation and the already-known upcoming ``roll_axis`` (the
+orchestrator sets it via ``set_parameters`` before this call even
+starts) -- entirely on paper, before the gripper ever moves.
+``pick_dice()`` folds this straight into the grasp approach pose itself:
+the gripper is open and clear of the die throughout approach and
+descent, so choosing its yaw there costs no extra motion and, unlike the
+old post-lift alignment step this replaces, never touches the die's own
+orientation at all -- only the still-open gripper's pose changes.
 
-Because this yaw rigidly carries the die with it, and depends on the
-face currently grasped (see ``align_grip_axis()``'s own docstring for
-why forcing it to be fully deterministic does not actually help), a
-given ``(face, roll_axis)`` roll's resulting face is not predictable in
-closed form -- see ``dice_face_map``'s module docstring for the planning
-consequence: there is no shortcut around trying each ``(face, move)``
-pair at least once, and a couple of the six faces are only ever reached
-by the die spawning on them, never by a roll.
+Because the die is consequently *never* yawed about world Z by anything
+in this sequence -- not at grasp, not during the roll, not at release --
+a given ``(orientation, roll_axis)`` roll's resulting face is exact,
+closed-form geometry, not something that has to be learned by trial —
+see ``dice_face_map``'s module docstring for the planning consequence
+(the full six-face layout is known after a single
+``/dice_identification`` reading, and every face is reachable from every
+orientation, worst case 3 rolls).
 
 **Why release always happens at a fixed spot** (``release_position``,
 a world (X, Y) configured per cell), never wherever the dice happened to
@@ -193,8 +210,6 @@ class DiceManipulator:
         self.grasp_offset = gp('grasp_offset').value
         self.lift_distance = gp('lift_distance').value
         self.place_safety_height = gp('place_safety_height').value
-        self.align_grip_before_roll = gp('align_grip_before_roll').value
-        self.align_tolerance_deg = gp('align_tolerance_deg').value
 
         # Fixed world-frame (X, Y) every roll+release targets -- see
         # roll_dice()'s docstring for why this must be a fixed, known-safe
@@ -341,11 +356,44 @@ class DiceManipulator:
     def identify_dice(self) -> Tuple[Optional[int], Optional[PoseStamped]]:
         return identify_dice(self._client_node, self._dice_identification_client)
 
-    def pick_dice(self) -> bool:
-        """Approach from above, grasp on live ``dice_tf`` and attach."""
+    def grasp_orientation(self, dice_quat_at_pick: Quat, roll_axis: str) -> Quat:
+        """
+        Pick a top-down grasp yaw whose jaws end up parallel to ``roll_axis``.
+
+        Decided in ``dice_grasp_frame``, entirely *before* the gripper
+        ever touches the die. See the module docstring's "Why the grasp
+        yaw is picked before grasping, not after". Because the die is
+        always axis-aligned at pick time (nothing in this sequence
+        ever yaws it about world Z),
+        ``dice_tf``'s X/Y axes are always exactly parallel to world X/Y,
+        so the two candidates below (``GRASP_DOWN_QUAT`` with 0 or 90 deg
+        of extra yaw about ``dice_tf``'s own Z -- which *is* world Z
+        here) are the only two that can possibly matter; picking by exact
+        dot product is not an approximation.
+        """
+        target = (1.0, 0.0, 0.0) if roll_axis == 'x' else (0.0, 1.0, 0.0)
+        best_quat, best_score = GRASP_DOWN_QUAT, -1.0
+        for psi in (0.0, math.pi / 2.0):
+            yaw = quaternion_about_axis(psi, (0.0, 0.0, 1.0))
+            candidate = quaternion_multiply(yaw, GRASP_DOWN_QUAT)
+            grip_dir = _rotate_vector(
+                (1.0, 0.0, 0.0), quaternion_multiply(dice_quat_at_pick, candidate))
+            score = abs(grip_dir[0] * target[0] + grip_dir[1] * target[1])
+            if score > best_score:
+                best_quat, best_score = candidate, score
+        return best_quat
+
+    def pick_dice(self, grasp_quat: Quat) -> bool:
+        """
+        Approach from above and grasp on live ``dice_tf``, then attach.
+
+        ``grasp_quat`` (from ``grasp_orientation()``) is ``dice_tf``-flush
+        *and* already yawed for the upcoming roll -- see the module
+        docstring.
+        """
         approach = self._pose(self.dice_grasp_frame,
                               (0.0, 0.0, self.approach_distance),
-                              GRASP_DOWN_QUAT)
+                              grasp_quat)
         self._log.info('Moving to pre-grasp pose...')
         res = self._safe_call(
             'move_to_pose(pre-grasp)',
@@ -356,7 +404,7 @@ class DiceManipulator:
 
         grasp = self._pose(self.dice_grasp_frame,
                            (0.0, 0.0, self.grasp_offset),
-                           GRASP_DOWN_QUAT)
+                           grasp_quat)
         self._log.info('Descending to grasp pose...')
         res = self._safe_call(
             'move_to_pose(grasp)',
@@ -385,76 +433,15 @@ class DiceManipulator:
             default=self._failed_moveit_result())
         return self._ok(res, 'move_to_pose(lift)')
 
-    def align_grip_axis(self, current_quat: Quat, roll_axis: str) -> Optional[Quat]:
-        """
-        Yaw the tool until the gripper's opening axis is horizontal.
-
-        Rotates about world Z (position unchanged) until the tool's
-        local X axis lines up exactly with ``roll_axis``'s world
-        direction -- see the module docstring's "Why align the grip
-        axis" for the full reasoning. Returns the resulting world-frame
-        tool orientation, or None on failure. A no-op (returns
-        ``current_quat`` unchanged) if already within
-        ``align_tolerance_deg``, or if ``align_grip_before_roll`` is
-        False.
-
-        Picks whichever of the two 180-deg-apart yaws that bring the
-        jaws' LINE onto the target axis' line is smaller (the gripper is
-        symmetric front/back, so only mod 180 deg matters *to the
-        gripper*). The *die*, rigidly attached, is not symmetric under
-        that 180 deg flip, so which of the two the die's landing yaw
-        happens to be closer to does affect which face a given
-        (face, roll_axis) roll ends up producing -- forcing a single,
-        always-the-same target instead does not fix this: simulated
-        against this project's own die geometry, it makes each
-        (face, roll_axis) deterministic individually, but two of the six
-        faces then become structurally unreachable as a roll *result* no
-        matter which of the two fixed targets is picked (a property of
-        this die's own geometry combined with only having two candidate
-        world axes available, not of the alignment choice) -- see
-        ``dice_face_map``'s module docstring. Picking the smaller yaw
-        keeps the two-outcome variability, which is exactly what lets
-        ``dice_task_orchestrator`` reach every face that *is* reachable
-        at all with this candidate set, learned empirically.
-        """
-        if not self.align_grip_before_roll:
-            return current_quat
-
-        target = (1.0, 0.0, 0.0) if roll_axis == 'x' else (0.0, 1.0, 0.0)
-        grip_dir = _rotate_vector((1.0, 0.0, 0.0), current_quat)
-
-        # Smallest yaw (about world Z) that brings the jaws' LINE (the
-        # gripper is symmetric front/back, so only mod 180 deg matters)
-        # onto the target axis' line.
-        delta = math.atan2(target[1], target[0]) - math.atan2(grip_dir[1], grip_dir[0])
-        delta = (delta + math.pi / 2.0) % math.pi - math.pi / 2.0
-
-        if abs(delta) < math.radians(self.align_tolerance_deg):
-            self._log.info('Grip axis already aligned with the roll axis; skipping.')
-            return current_quat
-
-        self._log.info(
-            f'Aligning grip axis to world-{roll_axis} '
-            f'({math.degrees(delta):+.1f} deg yaw)...')
-        yaw_delta = quaternion_about_axis(delta, (0.0, 0.0, 1.0))
-        pose = self._pose(self.world_frame, (0.0, 0.0, 0.0), yaw_delta)
-        res = self._safe_call(
-            'move_to_pose(align-grip)',
-            lambda: self._motion.move_to_pose(pose, cartesian_motion=False,
-                                              relative_motion=True),
-            default=self._failed_moveit_result())
-        if not self._ok(res, 'move_to_pose(align-grip)'):
-            return None
-        return quaternion_multiply(yaw_delta, current_quat)
-
     def roll_dice(self, table_z: float, current_quat: Quat) -> Optional[Quat]:
         """
         Roll the held dice one quarter turn, translating to ``release_position``.
 
         Applies ``roll_axis``/``roll_angle_deg`` on top of
         ``current_quat`` (the tool's actual current orientation --
-        typically already grip-axis-aligned, see ``align_grip_axis()``)
-        while, in the very same move, carrying the dice to the fixed
+        already grip-axis-aligned at grasp time, see
+        ``grasp_orientation()``) while, in the very same move, carrying
+        the dice to the fixed
         world (X, Y) in ``release_position`` -- see the module docstring's
         "Why release always happens at a fixed spot" for why every roll
         ends there rather than near wherever the dice was picked up.
@@ -496,7 +483,7 @@ class DiceManipulator:
         Release the dice at ``release_position``, where ``roll_dice()`` left it.
 
         A straight-down relative Cartesian descent (orientation
-        unchanged -- kept exactly as ``roll_dice()``/``align_grip_axis()``
+        unchanged -- kept exactly as ``grasp_orientation()``/``roll_dice()``
         left it, i.e. jaws horizontal, see module docstring), open, detach,
         retreat. Always opens+detaches even if the descent itself fails --
         releasing from wherever the arm is beats leaving the dice attached,
@@ -640,7 +627,14 @@ class DiceManipulator:
         dice_quat_at_pick = (pick_pose.pose.orientation.x, pick_pose.pose.orientation.y,
                              pick_pose.pose.orientation.z, pick_pose.pose.orientation.w)
 
-        if not self.pick_dice():
+        # Known before contact -- dice_task_orchestrator always sets this
+        # via set_parameters before calling this service -- so the grasp
+        # yaw can be chosen for the upcoming roll from the very first
+        # move, see grasp_orientation()/the module docstring.
+        axis, _ = self._current_roll()
+        grasp_quat = self.grasp_orientation(dice_quat_at_pick, axis)
+
+        if not self.pick_dice(grasp_quat):
             return False, 'pick failed'
 
         # From here on the dice is rigidly attached: any failure below
@@ -649,18 +643,11 @@ class DiceManipulator:
         # sequence -- always a value a motion just reported success at,
         # never re-derived from a (possibly stale) TF lookup, see module
         # docstring.
-        current_quat = quaternion_multiply(dice_quat_at_pick, GRASP_DOWN_QUAT)
+        current_quat = quaternion_multiply(dice_quat_at_pick, grasp_quat)
 
         if not self.lift():
             self._recover(place_xyz, current_quat)
             return False, 'lift failed'
-
-        axis, _ = self._current_roll()
-        aligned_quat = self.align_grip_axis(current_quat, axis)
-        if aligned_quat is None:
-            self._recover(place_xyz, current_quat)
-            return False, 'grip alignment failed'
-        current_quat = aligned_quat
 
         roll_quat = self.roll_dice(place_xyz[2], current_quat)
         if roll_quat is None:
@@ -715,13 +702,6 @@ def _declare_parameters(node: Node) -> None:
     # dice_manipulation_config.yaml) -- confirm against the real/sim TF
     # before trusting it near a physical barrier.
     node.declare_parameter('release_position', [1.0, 0.6])
-
-    # Yaw the gripper's opening axis to line up exactly with the roll
-    # axis before rolling, so release is always exactly horizontal (see
-    # module docstring's "Why align the grip axis"). Disable only if this
-    # extra motion turns out to cause its own planning failures.
-    node.declare_parameter('align_grip_before_roll', True)
-    node.declare_parameter('align_tolerance_deg', 1.0)
 
     # Which fixed world axis the roll turns about ('x' or 'y') and by how
     # much (deg). Normally overridden at runtime (via set_parameters) by
