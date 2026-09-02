@@ -27,6 +27,9 @@ setup(
     entry_points={
         'console_scripts': [
             'demo_node = drims_homework.demo_node:main',
+            'dice_manipulation_node = drims_homework.dice_manipulation_node:main',
+            'dice_task_orchestrator = drims_homework.dice_task_orchestrator:main',
+            'dice_simulator_healer = drims_homework.dice_simulator_healer:main',
         ],
     },
 )

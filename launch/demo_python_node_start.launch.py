@@ -38,7 +38,7 @@ def generate_launch_description():
         parameters=[
             LaunchConfiguration('demo_node_config_path'),
         ])
-    
+
     ld = LaunchDescription()
 
     ld.add_action(demo_node_config_path_cmd)

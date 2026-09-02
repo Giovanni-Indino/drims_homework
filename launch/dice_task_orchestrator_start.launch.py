@@ -1,5 +1,4 @@
-
-# Copyright 2024 National Research Council STIIMA
+# Copyright 2026 DRIMS3 Summer School
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -25,22 +24,21 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_dir = get_package_share_directory('drims_homework')
 
-    bt_config_path_cmd = DeclareLaunchArgument(
-        'bt_executer_config_path',
-        default_value=pkg_dir + '/config/behavior_tree_config.yaml',
-        description='Full path to the bt executer config path config file')
+    config_path_cmd = DeclareLaunchArgument(
+        'dice_task_orchestrator_config_path',
+        default_value=pkg_dir + '/config/dice_task_orchestrator_config.yaml',
+        description='Full path to the dice_task_orchestrator config file')
 
-    bt_executer_node = Node(
-        package='easy_motion_behavior_tree',
-        executable='bt_executer_node',
-        name='bt_executer_node',
+    dice_task_orchestrator_node = Node(
+        package='drims_homework',
+        executable='dice_task_orchestrator',
+        name='dice_task_orchestrator',
         output='screen',
         parameters=[
-            LaunchConfiguration('bt_executer_config_path'),
+            LaunchConfiguration('dice_task_orchestrator_config_path'),
         ])
 
     ld = LaunchDescription()
-
-    ld.add_action(bt_config_path_cmd)
-    ld.add_action(bt_executer_node)
+    ld.add_action(config_path_cmd)
+    ld.add_action(dice_task_orchestrator_node)
     return ld

@@ -1,0 +1,86 @@
+dice_manipulation_node:
+  ros__parameters:
+    # --- Object / frames -------------------------------------------------
+    object_id: "dice"           # id of the dice in the MoveIt planning scene
+    world_frame: "world"        # fixed reference frame
+    dice_grasp_frame: "dice_tf" # frame aligned with the face-up side (pre-grasp)
+    attach_frame: "tip"         # robot link the dice is attached to on grasp
+
+    # --- Home configuration (UR5e, rad) --------------------------------
+    # [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
+    # Only used at the very start/end of pick_rotate_place() now -- the
+    # roll itself happens near the table, see roll_axis/roll_angle_deg
+    # below and roll_dice()'s docstring.
+    home_joints: [0.0, -1.97, 2.13, -1.83, -1.50, 0.0]
+
+    # --- Gripper (hand-e, meters) -------------------------------------
+    gripper_open: 0.045
+    gripper_close: 0.0
+    gripper_max_effort: 20.0
+
+    # --- Pick / place geometry (meters) ------------------------------
+    approach_distance: 0.10   # pre-grasp height above the table
+    grasp_offset: 0.0         # extra Z at the grasp pose (+ = higher)
+    # How much the dice is lifted before rolling -- this is also the
+    # height at which the roll itself happens (roll_dice() keeps Z fixed
+    # at table_z + lift_distance while it rotates+translates). Bumped up
+    # from 0.15: only the 'x' candidate roll was ever observed to
+    # succeed, never 'y' -- raised here to test whether 'y' was failing
+    # because the die/gripper swept too close to the table (or a barrier)
+    # while turning, not because of a genuine kinematic limit. Revert
+    # towards 0.15 once confirmed either way.
+    lift_distance: 0.20
+    # Clearance kept above the table when releasing (never touch down
+    # exactly -- see release_after_roll()'s docstring): small enough that
+    # releasing from there is a negligible drop, large enough that the
+    # wrist/gripper never drives into the table. Bumped up from 0.02 for
+    # the same 'y' roll diagnostic as lift_distance above.
+    place_safety_height: 0.05
+    # Fixed world (X, Y) EVERY roll carries the dice to, in the same move
+    # as the rotation, before releasing -- see dice_manipulation_node's
+    # module docstring, "Why release always happens at a fixed spot":
+    # wherever the dice was actually picked up from can be close to a
+    # table edge or a cell safety barrier, so opening the gripper there
+    # risks the gripper body itself colliding with something. Picking is
+    # unavoidably wherever the dice is; releasing does not have to be.
+    # UNVERIFIED DEFAULT -- tune for your own cell: must be well clear of
+    # every barrier/edge, comfortably reachable in a roughly-top-down
+    # orientation regardless of which face was just picked up from.
+    # For this cell (ur5e_1 / configuration_cell_1.yaml): robot base sits
+    # at ~(0.4, 0.5, 0.75) in `world`, the dice is typically found around
+    # (1.0, 0.7, 0.78) -- the default below is only a rough guess at a
+    # central, clear spot; confirm against the real/sim TF (echo
+    # `dice_com_tf` after a few picks, or just watch RViz) before
+    # trusting it near a physical barrier.
+    release_position: [1.0, 0.6]
+
+    # Yaw the gripper's opening axis to line up exactly with roll_axis
+    # before rolling, so the jaws are always exactly horizontal at
+    # release (see dice_manipulation_node's module docstring, "Why align
+    # the grip axis"). Disable only if this extra motion itself causes
+    # planning failures.
+    align_grip_before_roll: true
+    align_tolerance_deg: 1.0
+
+    # --- Roll applied to the held dice, near the table ------------------
+    # Rotates the die by roll_angle_deg about a FIXED WORLD axis ('x' or
+    # 'y') -- NOT the die's own body axis, see roll_dice()'s docstring for
+    # why (world-fixed keeps the required wrist sweep the same physical
+    # motion every time, regardless of the die's landing yaw). These two
+    # are normally overridden at runtime (via set_parameters) by
+    # dice_task_orchestrator, which decides the roll needed for the
+    # requested target face; the values below are only the default used
+    # for a standalone/manual test.
+    roll_axis: "x"
+    roll_angle_deg: 90.0
+
+    # --- Execution -------------------------------------------------------
+    velocity_scaling: 0.3
+    identify_after: true      # re-run /dice_identification at the end
+    # false: wait to be driven via ~/pick_rotate_place (e.g. by
+    # dice_task_orchestrator, or "ros2 service call ... std_srvs/srv/Trigger
+    # '{}'" for a manual test). Set to true only when running this node on
+    # its own, with no orchestrator, to smoke-test a single roll at start-up.
+    run_on_start: false
+
+    gripper_action_name: "/gripper_action_controller/gripper_cmd"

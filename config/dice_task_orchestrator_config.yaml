@@ -1,0 +1,30 @@
+dice_task_orchestrator:
+  ros__parameters:
+    # Face the die should end up showing (1-6). 0 = unset: run_on_start is
+    # skipped and you must set it + call the service explicitly, e.g.
+    #   ros2 param set /dice_task_orchestrator target_face 6
+    #   ros2 service call /dice_task_orchestrator/reach_target_face std_srvs/srv/Trigger "{}"
+    target_face: 0
+
+    # Safety bound on how many pick-rotate-place rolls a single request
+    # may take. Every roll is a 90 deg quarter-turn about a fixed WORLD
+    # axis (opposite faces are reached in 2 chained rolls, not 1 -- see
+    # dice_face_map.py's module docstring). Only 2 candidate rolls are
+    # used (the other 2 over-rotate the gripper on this cell, see
+    # dice_face_map.CANDIDATE_ROLLS), and a world-fixed roll's
+    # single-roll outcome can vary across landing yaws, so exploration is
+    # noticeably less efficient than with more/body-relative candidates:
+    # verified with a full physical-cube simulation (see
+    # dice_task_orchestrator.py's module docstring), worst case 31 rolls
+    # for a first-ever request, average ~5 once warmed up. Keep this
+    # generous; lower it once re-verified against the real robot/simulator.
+    max_attempts: 50
+
+    # Name of the dice_manipulation_node instance to drive (its
+    # set_parameters and ~/pick_rotate_place services).
+    manipulation_node_name: "dice_manipulation_node"
+
+    # Perception service contract (see drims_homework/dice_common.py).
+    dice_identification_service: "dice_identification"
+
+    run_on_start: false

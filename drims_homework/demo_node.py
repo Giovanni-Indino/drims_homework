@@ -8,11 +8,12 @@ from typing import Tuple
 
 GRIPPER_ACTION_NAME = '/gripper_action_controller/gripper_cmd'
 
+
 class VisionClientNode(Node):
     def __init__(self):
-        super().__init__('vision_client_node', use_global_arguments=False) 
-        self.dice_identification_client = self.create_client(DiceIdentification, 
-                                                             'dice_identification')
+        super().__init__('vision_client_node', use_global_arguments=False)
+        self.dice_identification_client = self.create_client(
+            DiceIdentification, 'dice_identification')
 
     def dice_identification(self) -> Tuple[int, PoseStamped, bool]:
         if not self.dice_identification_client.wait_for_service(timeout_sec=5.0):
@@ -22,13 +23,12 @@ class VisionClientNode(Node):
 
         result_future = self.dice_identification_client.call_async(request)
         rclpy.spin_until_future_complete(self, result_future)
-        
+
         face_number = result_future.result().face_number
         pose = result_future.result().pose
         success = result_future.result().success
 
         return face_number, pose, success
-
 
 
 def main():
@@ -37,7 +37,7 @@ def main():
     # MotionClient is already a Node, so we can use its logger directly
     motion_client_node = MotionClient(gripper_action_name=GRIPPER_ACTION_NAME)
     vision_client_node = VisionClientNode()
-    demo_node          = rclpy.create_node(node_name="demo_node", use_global_arguments=False)
+    demo_node = rclpy.create_node(node_name="demo_node", use_global_arguments=False)
 
     logger = demo_node.get_logger()
 
@@ -48,7 +48,7 @@ def main():
     result = motion_client_node.move_to_joint(home_joints)
     logger.info(f"Home reached: {result.val}")
     reached_goal, stalled = motion_client_node.gripper_command(position=0.045)  # Open gripper
-    
+
     if result.val != MoveItErrorCodes.SUCCESS:
         logger.error(f"Failed to reach home configuration: {result.val}")
         motion_client_node.destroy_node()
@@ -80,10 +80,9 @@ def main():
     pick_pose.pose.orientation.z = 0.0
     pick_pose.pose.orientation.w = 0.0
 
-
     logger.info("Moving to pick pose...")
     result = motion_client_node.move_to_pose(pick_pose, cartesian_motion=False)
-    
+
     if result.val != MoveItErrorCodes.SUCCESS:
         logger.error(f"Failed to reach pick pose: {result.val}")
         motion_client_node.destroy_node()
@@ -100,7 +99,8 @@ def main():
     logger.info(f"Gripper closed (reached_goal={reached_goal}, stalled={stalled})")
 
     logger.info("Attaching object...")
-    success = motion_client_node.attach_object("dice", "tool0")  # "tool0" is the default TCP frame of UR10e
+    # "tool0" is the default TCP frame of UR10e
+    success = motion_client_node.attach_object("dice", "tool0")
     logger.info(f"Attach success: {success}")
 
     # --- 4) Move to another pose (place pose) ---
@@ -128,7 +128,8 @@ def main():
 
     # --- 5) Open gripper + detach object ---
     logger.info("Opening gripper...")
-    reached_goal, stalled = motion_client_node.gripper_command(position=0.045)  # 0.045 = open, adjust depending on gripper model
+    # 0.045 = open, adjust depending on gripper model
+    reached_goal, stalled = motion_client_node.gripper_command(position=0.045)
     logger.info(f"Gripper opened (reached_goal={reached_goal}, stalled={stalled})")
 
     logger.info("Detaching object...")
