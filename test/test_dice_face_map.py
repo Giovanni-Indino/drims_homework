@@ -29,8 +29,11 @@ from drims_homework.dice_face_map import (
     plan_min_sequence,
 )
 
-ROLL_X = ('x', 90.0)
-ROLL_Y = ('y', -90.0)
+# Track CANDIDATE_ROLLS rather than hard-coding the magnitude: only the
+# sign of the angle carries geometric meaning (see apply_roll()), the
+# magnitude is whatever dice_manipulation_node is told to sweep.
+ROLL_X = next(m for m in CANDIDATE_ROLLS if m[0] == 'x')
+ROLL_Y = next(m for m in CANDIDATE_ROLLS if m[0] == 'y')
 
 
 def _identity_orientation() -> DiceOrientation:

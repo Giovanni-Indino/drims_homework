@@ -149,6 +149,8 @@ from std_srvs.srv import Trigger
 from moveit_msgs.msg import MoveItErrorCodes
 from tf_transformations import quaternion_multiply, quaternion_about_axis
 
+from tf2_ros import Buffer, TransformListener
+
 from easy_motion.motion_client import MotionClient
 
 from drims_homework.dice_common import create_dice_identification_client, identify_dice
@@ -211,11 +213,18 @@ class DiceManipulator:
         self.lift_distance = gp('lift_distance').value
         self.place_safety_height = gp('place_safety_height').value
 
-        # Fixed world-frame (X, Y) every roll+release targets -- see
-        # roll_dice()'s docstring for why this must be a fixed, known-safe
-        # spot rather than wherever the dice happened to be picked from.
+        # Fixed (X, Y) every roll+release targets -- see roll_dice()'s
+        # docstring for why this must be a fixed, known-safe spot rather
+        # than wherever the dice happened to be picked from. Configured in
+        # ``release_frame`` (default ``base_link``, the natural frame for
+        # "somewhere on the table in front of the robot", same convention
+        # as drims_dice_simulator's spawn ``position``); resolved to
+        # ``world_frame`` once here via a static TF lookup, since every
+        # downstream pose (and the pick-time table height) is world-frame.
         release_xy = gp('release_position').value
-        self.release_position = (float(release_xy[0]), float(release_xy[1]))
+        release_frame = gp('release_frame').value
+        self.release_position = self._resolve_release_xy(
+            float(release_xy[0]), float(release_xy[1]), release_frame)
 
         # roll_axis/roll_angle_deg are deliberately NOT cached: they are
         # the two knobs dice_task_orchestrator changes at runtime (via
@@ -225,6 +234,47 @@ class DiceManipulator:
 
         self._dice_identification_client = create_dice_identification_client(
             self._client_node)
+
+    def _resolve_release_xy(self, x: float, y: float, frame: str) -> Tuple[float, float]:
+        """
+        Convert the configured release (X, Y) from ``frame`` to ``world_frame``.
+
+        ``frame == world_frame`` (or empty) is a no-op. Otherwise a one-off
+        static TF lookup (``world_frame`` <- ``frame``) is done here at
+        start-up -- ``base_link`` -> ``world`` on this cell carries a real
+        yaw (see configuration_cell_1.yaml: ``rpy "0 0 -1.57"``), so a bare
+        X/Y copy would be wrong. Unlike the die pose (which goes stale, see
+        the module docstring), this is a fixed robot transform, valid for
+        the node's whole life. On failure the raw numbers are kept and a
+        loud warning is logged -- check them against RViz before trusting
+        them near a barrier.
+        """
+        if not frame or frame == self.world_frame:
+            return (x, y)
+
+        buf = Buffer()
+        TransformListener(buf, self._client_node)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            try:
+                tf = buf.lookup_transform(self.world_frame, frame, rclpy.time.Time())
+                t = tf.transform.translation
+                q = (tf.transform.rotation.x, tf.transform.rotation.y,
+                     tf.transform.rotation.z, tf.transform.rotation.w)
+                rx, ry, _ = _rotate_vector((x, y, 0.0), q)
+                world_xy = (rx + t.x, ry + t.y)
+                self._log.info(
+                    f'release_position [{x:.3f}, {y:.3f}] in {frame!r} -> '
+                    f'[{world_xy[0]:.3f}, {world_xy[1]:.3f}] in {self.world_frame!r}')
+                return world_xy
+            except Exception:  # noqa: BLE001 -- TF not ready yet, keep waiting
+                rclpy.spin_once(self._client_node, timeout_sec=0.1)
+
+        self._log.error(
+            f"Could not look up {self.world_frame!r} <- {frame!r} to resolve "
+            f"release_position; using [{x:.3f}, {y:.3f}] as-is (frame {frame!r} "
+            f"values in a {self.world_frame!r} field -- verify against RViz!).")
+        return (x, y)
 
     # ------------------------------------------------------------------ #
     # Small utilities                                                     #
@@ -441,10 +491,12 @@ class DiceManipulator:
         ``current_quat`` (the tool's actual current orientation --
         already grip-axis-aligned at grasp time, see
         ``grasp_orientation()``) while, in the very same move, carrying
-        the dice to the fixed
-        world (X, Y) in ``release_position`` -- see the module docstring's
-        "Why release always happens at a fixed spot" for why every roll
-        ends there rather than near wherever the dice was picked up.
+        the dice to the fixed world (X, Y) in ``self.release_position``
+        (``release_position``/``release_frame`` resolved to world at
+        start-up, see ``_resolve_release_xy()``) -- see the module
+        docstring's "Why release always happens at a fixed spot" for why
+        every roll ends there rather than near wherever the dice was
+        picked up.
         ``table_z`` is the table-height reference read from
         ``/dice_identification`` at pick time (valid for any face, see
         ``pick_rotate_place()``). Returns the resulting world-frame tool
@@ -689,26 +741,28 @@ def _declare_parameters(node: Node) -> None:
     # Clearance kept above the table when releasing -- never touch down
     # exactly (see release_after_roll()/place_dice()).
     node.declare_parameter('place_safety_height', 0.05)
-    # Fixed world (X, Y) every roll carries the dice to before releasing
-    # -- see roll_dice()'s and the module docstring's "Why release always
-    # happens at a fixed spot": wherever the dice was actually picked up
-    # from can be close to a table edge or cell barrier, so releasing
-    # there risks the gripper body colliding with something as it opens.
-    # UNVERIFIED DEFAULT -- tune for your own cell: should be well clear
-    # of every barrier/edge, comfortably reachable in a top-down-ish
-    # orientation from any picked-up face. The value below is only a
-    # rough estimate (world origin ~ robot base + (0.4, 0.5), dice
-    # typically found around (1.0, 0.7) in world on this cell, see
-    # dice_manipulation_config.yaml) -- confirm against the real/sim TF
-    # before trusting it near a physical barrier.
-    node.declare_parameter('release_position', [1.0, 0.6])
+    # Fixed (X, Y) every roll carries the dice to before releasing -- see
+    # roll_dice()'s and the module docstring's "Why release always happens
+    # at a fixed spot": wherever the dice was actually picked up from can
+    # be close to a table edge or cell barrier, so releasing there risks
+    # the gripper body colliding with something as it opens. Given in
+    # ``release_frame`` (default ``base_link``: "somewhere on the table in
+    # front of the robot", the same convention as drims_dice_simulator's
+    # spawn ``position``) and resolved to ``world_frame`` at start-up, see
+    # _resolve_release_xy(). Tune for your own cell -- well clear of every
+    # barrier/edge, comfortably reachable in a top-down-ish orientation
+    # from any picked-up face; confirm against the real/sim TF.
+    node.declare_parameter('release_position', [0.0, 0.7])
+    node.declare_parameter('release_frame', 'base_link')
 
     # Which fixed world axis the roll turns about ('x' or 'y') and by how
     # much (deg). Normally overridden at runtime (via set_parameters) by
     # dice_task_orchestrator; the defaults below are only used for a
     # standalone/manual test.
     node.declare_parameter('roll_axis', 'x')
-    node.declare_parameter('roll_angle_deg', 90.0)
+    # 70, not 90: released ~20 deg early, gravity finishes the tip -- see
+    # dice_face_map.CANDIDATE_ROLLS. Overridden per-call by the orchestrator.
+    node.declare_parameter('roll_angle_deg', 70.0)
 
     node.declare_parameter('velocity_scaling', 0.3)
     node.declare_parameter('identify_after', True)

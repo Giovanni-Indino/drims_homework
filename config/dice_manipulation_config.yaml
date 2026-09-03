@@ -36,23 +36,24 @@ dice_manipulation_node:
     # wrist/gripper never drives into the table. Bumped up from 0.02 for
     # the same 'y' roll diagnostic as lift_distance above.
     place_safety_height: 0.05
-    # Fixed world (X, Y) EVERY roll carries the dice to, in the same move
-    # as the rotation, before releasing -- see dice_manipulation_node's
-    # module docstring, "Why release always happens at a fixed spot":
-    # wherever the dice was actually picked up from can be close to a
-    # table edge or a cell safety barrier, so opening the gripper there
-    # risks the gripper body itself colliding with something. Picking is
-    # unavoidably wherever the dice is; releasing does not have to be.
-    # UNVERIFIED DEFAULT -- tune for your own cell: must be well clear of
-    # every barrier/edge, comfortably reachable in a roughly-top-down
-    # orientation regardless of which face was just picked up from.
-    # For this cell (ur5e_1 / configuration_cell_1.yaml): robot base sits
-    # at ~(0.4, 0.5, 0.75) in `world`, the dice is typically found around
-    # (1.0, 0.7, 0.78) -- the default below is only a rough guess at a
-    # central, clear spot; confirm against the real/sim TF (echo
-    # `dice_com_tf` after a few picks, or just watch RViz) before
-    # trusting it near a physical barrier.
-    release_position: [1.0, 0.6]
+    # Fixed (X, Y) EVERY roll carries the dice to, in the same move as the
+    # rotation, before releasing -- see dice_manipulation_node's module
+    # docstring, "Why release always happens at a fixed spot": wherever the
+    # dice was actually picked up from can be close to a table edge or a
+    # cell safety barrier, so opening the gripper there risks the gripper
+    # body itself colliding with something. Picking is unavoidably wherever
+    # the dice is; releasing does not have to be.
+    #
+    # Given in `release_frame` below (base_link = "on the table in front of
+    # the robot", the same convention as drims_dice_simulator's spawn
+    # `position`); the node resolves it to `world` once at start-up via TF
+    # (base_link -> world carries a real yaw on this cell -- see
+    # configuration_cell_1.yaml `rpy "0 0 -1.57"` -- so it is NOT a bare
+    # X/Y copy; see _resolve_release_xy()). [0.0, 0.7] in base_link is
+    # roughly the middle of the table on ur5e_1 (same spot the dice was
+    # spawned at for testing). Confirm against RViz near a physical barrier.
+    release_position: [0.0, 0.7]
+    release_frame: "base_link"
 
     # Note: there used to be an align_grip_before_roll/align_tolerance_deg
     # pair here, for a post-lift yaw that squared the gripper's jaws to
@@ -73,7 +74,14 @@ dice_manipulation_node:
     # requested target face; the values below are only the default used
     # for a standalone/manual test.
     roll_axis: "x"
-    roll_angle_deg: 90.0
+    # 70, not 90: the die is released ~20 deg before the full quarter turn
+    # and gravity finishes tipping it onto the new face (kept the wrist out
+    # of the config where a full 90 deg sweep was failing). The planner in
+    # dice_face_map still reasons in exact 90 deg turns -- it only reads the
+    # sign of this angle. Normally overridden at runtime by the orchestrator
+    # (from dice_face_map.CANDIDATE_ROLLS, also 70). Put back to 90 if the
+    # die does not reliably complete the tip.
+    roll_angle_deg: 70.0
 
     # --- Execution -------------------------------------------------------
     velocity_scaling: 0.3
