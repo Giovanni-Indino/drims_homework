@@ -30,6 +30,7 @@ setup(
             'dice_manipulation_node = drims_homework.dice_manipulation_node:main',
             'dice_task_orchestrator = drims_homework.dice_task_orchestrator:main',
             'dice_simulator_healer = drims_homework.dice_simulator_healer:main',
+            'yellow_dice_localizer = drims_homework.yellow_dice_localizer:main',
         ],
     },
 )

@@ -1,0 +1,31 @@
+yellow_dice_localizer:
+  ros__parameters:
+    image_topic: /oak/rgb/image_raw/compressed
+    camera_info_topic: /oak/rgb/camera_info
+    pose_topic: /yellow_dice/pose
+    point_topic: /yellow_dice/position
+    debug_image_topic: /yellow_dice/debug_image
+    die_mask_topic: /yellow_dice/die_mask
+    top_face_mask_topic: /yellow_dice/top_face_mask
+    pip_mask_topic: /yellow_dice/pip_mask
+    top_face_topic: /yellow_dice/top_face
+    face_number_topic: /yellow_dice/face_number
+    face_orientation_topic: /yellow_dice/face_orientation_deg
+
+    # Physical side length of the die in metres. Measure the real die: this
+    # value directly sets the metric scale of the reported position.
+    die_size_m: 0.025
+    # The upper face is brighter than the yellow side walls in the bags.
+    # A pixel must exceed both this stricter absolute value and the selected
+    # percentile of yellow pixels inside the complete dice bounding box.
+    top_face_min_value: 220
+    top_face_brightness_percentile: 70.0
+
+    # OpenCV HSV limits for the yellow die in the supplied OAK recordings.
+    hsv_lower: [15, 80, 80]
+    hsv_upper: [32, 255, 255]
+    min_area_px: 200.0
+    publish_debug_image: true
+    # Opens a live OpenCV window on a desktop session. Set false on a server.
+    show_window: true
+    window_name: "Yellow die vision"

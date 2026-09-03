@@ -76,3 +76,43 @@ ros2 service call /dice_manipulation_node/pick_rotate_place std_srvs/srv/Trigger
 
 Config: [`config/dice_manipulation_config.yaml`](config/dice_manipulation_config.yaml),
 [`config/dice_task_orchestrator_config.yaml`](config/dice_task_orchestrator_config.yaml).
+
+## Yellow-die localization from the OAK RGB camera
+
+`yellow_dice_localizer` detects the yellow die in
+`/oak/rgb/image_raw/compressed`, uses `/oak/rgb/camera_info` and square PnP
+to publish the centre of its upper face in **camera optical-frame coordinates**
+(metres: X right, Y down, Z forward):
+
+```bash
+ros2 launch drims_homework yellow_dice_localizer_start.launch.py
+ros2 topic echo /yellow_dice/pose
+```
+
+The same node works directly on the supplied recordings; no physical camera
+is required. Replay one bag together with the localizer:
+
+```bash
+ros2 launch drims_homework yellow_dice_bag.launch.py \
+  bag_path:=/home/drims/bags/setup_1/rosbag2_2026_09_01-09_14_02 rate:=1.0
+```
+
+While it runs, inspect the estimated position with `ros2 topic echo
+/yellow_dice/pose` or open `/yellow_dice/debug_image` in RViz/rqt_image_view.
+The result topics retain their last value; after replay use
+`ros2 topic echo --qos-durability transient_local /yellow_dice/face_number`.
+
+It opens an OpenCV window by default and publishes `/yellow_dice/position`
+(`PointStamped`), the annotated `/yellow_dice/debug_image`, rectified
+`/yellow_dice/top_face`, the counted `/yellow_dice/face_number` (`Int32`),
+and `/yellow_dice/face_orientation_deg` (`Float64`, modulo 90 degrees).
+The separate **Yellow die masks** window shows the exact binary masks used for
+the yellow die, bright upper face, and locally high-contrast pips; they are also published as
+`/yellow_dice/die_mask`, `/yellow_dice/top_face_mask`, and
+`/yellow_dice/pip_mask`.
+Set `die_size_m` in
+[`config/yellow_dice_localizer_config.yaml`](config/yellow_dice_localizer_config.yaml)
+to the measured edge length of the physical die: this is required to obtain a
+metric 3D position from an RGB camera. The node intentionally only localizes
+the die; exposing it through the package's `dice_identification` service and
+recognizing the upper face are the next pipeline steps.
