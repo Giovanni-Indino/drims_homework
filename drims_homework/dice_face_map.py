@@ -137,12 +137,12 @@ Quat = Tuple[float, float, float, float]  # (x, y, z, w)
 # Only the *sign* of the angle is ever read here (apply_roll()): the
 # planning geometry always treats a roll as an exact 90 deg quarter turn.
 # The magnitude is what dice_manipulation_node actually commands the wrist
-# to sweep -- deliberately 70, not 90: the die is released ~20 deg before
+# to sweep -- deliberately 60, not 90: the die is released ~30 deg before
 # the full quarter turn and gravity finishes tipping it onto the new
 # face, which keeps the wrist away from the configuration where a full
 # 90 deg sweep was failing. If the die does not reliably complete the
-# tip on your cell, put these back to +-90.
-CANDIDATE_ROLLS: List[Move] = [('x', 70.0), ('y', -70.0)]
+# tip on your cell, raise these back towards +-90.
+CANDIDATE_ROLLS: List[Move] = [('x', 60.0), ('y', -60.0)]
 
 # This die's numbering: which body axis each face sits on. Opposite faces
 # sum to 7 (a standard die), and the specific signs/axes below match
@@ -241,7 +241,7 @@ def apply_roll(move: Move, v: Vec3) -> Vec3:
     Exact integer arithmetic (no trig, no rounding): only ``sign(angle_deg)``
     is used -- every roll is treated as an exact 90 deg quarter turn about
     world x or y regardless of the commanded magnitude (see
-    ``CANDIDATE_ROLLS`` for why the magnitude is 70, not 90).
+    ``CANDIDATE_ROLLS`` for why the magnitude is 60, not 90).
     """
     axis, angle_deg = move
     x, y, z = v

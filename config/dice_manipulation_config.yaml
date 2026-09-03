@@ -17,6 +17,9 @@ dice_manipulation_node:
     gripper_open: 0.045
     gripper_close: 0.0
     gripper_max_effort: 20.0
+    # Seconds held still after every gripper open/close, so the jaws settle
+    # and the die actually falls/is gripped before the next move starts.
+    gripper_settle_time: 1.0
 
     # --- Pick / place geometry (meters) ------------------------------
     approach_distance: 0.10   # pre-grasp height above the table
@@ -33,9 +36,9 @@ dice_manipulation_node:
     # Clearance kept above the table when releasing (never touch down
     # exactly -- see release_after_roll()'s docstring): small enough that
     # releasing from there is a negligible drop, large enough that the
-    # wrist/gripper never drives into the table. Bumped up from 0.02 for
-    # the same 'y' roll diagnostic as lift_distance above.
-    place_safety_height: 0.05
+    # wrist/gripper never drives into the table. Lowered back to 0.02 so
+    # the die is released from closer to the table (less bounce/roll).
+    place_safety_height: 0.02
     # Fixed (X, Y) EVERY roll carries the dice to, in the same move as the
     # rotation, before releasing -- see dice_manipulation_node's module
     # docstring, "Why release always happens at a fixed spot": wherever the
@@ -74,14 +77,14 @@ dice_manipulation_node:
     # requested target face; the values below are only the default used
     # for a standalone/manual test.
     roll_axis: "x"
-    # 70, not 90: the die is released ~20 deg before the full quarter turn
+    # 60, not 90: the die is released ~30 deg before the full quarter turn
     # and gravity finishes tipping it onto the new face (kept the wrist out
     # of the config where a full 90 deg sweep was failing). The planner in
     # dice_face_map still reasons in exact 90 deg turns -- it only reads the
     # sign of this angle. Normally overridden at runtime by the orchestrator
-    # (from dice_face_map.CANDIDATE_ROLLS, also 70). Put back to 90 if the
-    # die does not reliably complete the tip.
-    roll_angle_deg: 70.0
+    # (from dice_face_map.CANDIDATE_ROLLS, also 60). Raise back towards 90
+    # if the die does not reliably complete the tip.
+    roll_angle_deg: 60.0
 
     # --- Execution -------------------------------------------------------
     velocity_scaling: 0.3

@@ -212,6 +212,7 @@ class DiceManipulator:
         self.grasp_offset = gp('grasp_offset').value
         self.lift_distance = gp('lift_distance').value
         self.place_safety_height = gp('place_safety_height').value
+        self.gripper_settle_time = gp('gripper_settle_time').value
 
         # Fixed (X, Y) every roll+release targets -- see roll_dice()'s
         # docstring for why this must be a fixed, known-safe spot rather
@@ -392,6 +393,8 @@ class DiceManipulator:
                 position=self.gripper_open, max_effort=self.gripper_max_effort),
             default=(False, False))
         self._log.info(f'Gripper opened (reached_goal={reached})')
+        if self.gripper_settle_time > 0.0:
+            time.sleep(self.gripper_settle_time)
         return True
 
     def close_gripper(self) -> bool:
@@ -401,6 +404,8 @@ class DiceManipulator:
                 position=self.gripper_close, max_effort=self.gripper_max_effort),
             default=(False, False))
         self._log.info(f'Gripper closed (reached_goal={reached}, stalled={stalled})')
+        if self.gripper_settle_time > 0.0:
+            time.sleep(self.gripper_settle_time)
         return True
 
     def identify_dice(self) -> Tuple[Optional[int], Optional[PoseStamped]]:
@@ -739,8 +744,13 @@ def _declare_parameters(node: Node) -> None:
     # observed to succeed).
     node.declare_parameter('lift_distance', 0.20)
     # Clearance kept above the table when releasing -- never touch down
-    # exactly (see release_after_roll()/place_dice()).
-    node.declare_parameter('place_safety_height', 0.05)
+    # exactly (see release_after_roll()/place_dice()). Lowered back to 0.02
+    # so the die is dropped from closer to the table (less bounce/roll on
+    # release).
+    node.declare_parameter('place_safety_height', 0.02)
+    # Seconds to hold still after a gripper open/close command, so the
+    # jaws physically settle / the die actually falls before the next move.
+    node.declare_parameter('gripper_settle_time', 1.0)
     # Fixed (X, Y) every roll carries the dice to before releasing -- see
     # roll_dice()'s and the module docstring's "Why release always happens
     # at a fixed spot": wherever the dice was actually picked up from can
@@ -760,9 +770,9 @@ def _declare_parameters(node: Node) -> None:
     # dice_task_orchestrator; the defaults below are only used for a
     # standalone/manual test.
     node.declare_parameter('roll_axis', 'x')
-    # 70, not 90: released ~20 deg early, gravity finishes the tip -- see
+    # 60, not 90: released ~30 deg early, gravity finishes the tip -- see
     # dice_face_map.CANDIDATE_ROLLS. Overridden per-call by the orchestrator.
-    node.declare_parameter('roll_angle_deg', 70.0)
+    node.declare_parameter('roll_angle_deg', 60.0)
 
     node.declare_parameter('velocity_scaling', 0.3)
     node.declare_parameter('identify_after', True)
