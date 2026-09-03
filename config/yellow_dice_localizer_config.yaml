@@ -14,17 +14,23 @@ yellow_dice_localizer:
 
     # Physical side length of the die in metres. Measure the real die: this
     # value directly sets the metric scale of the reported position.
-    die_size_m: 0.025
+    die_size_m: 0.030
     # The upper face is brighter than the yellow side walls in the bags.
     # A pixel must exceed both this stricter absolute value and the selected
     # percentile of yellow pixels inside the complete dice bounding box.
     top_face_min_value: 220
     top_face_brightness_percentile: 70.0
+    # Publish a face number only after this many equal pip counts in the last
+    # five valid frames, avoiding a one-frame partial pip detection.
+    pip_consensus_frames: 3
 
     # OpenCV HSV limits for the yellow die in the supplied OAK recordings.
     hsv_lower: [15, 80, 80]
     hsv_upper: [32, 255, 255]
     min_area_px: 200.0
+    # Reject elongated yellow structures (e.g. image-border reflections): a
+    # die contour must have min(width, height) / max(width, height) >= this.
+    min_square_aspect_ratio: 0.65
     publish_debug_image: true
     # Opens a live OpenCV window on a desktop session. Set false on a server.
     show_window: true

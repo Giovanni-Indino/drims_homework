@@ -80,9 +80,15 @@ Config: [`config/dice_manipulation_config.yaml`](config/dice_manipulation_config
 ## Yellow-die localization from the OAK RGB camera
 
 `yellow_dice_localizer` detects the yellow die in
-`/oak/rgb/image_raw/compressed`, uses `/oak/rgb/camera_info` and square PnP
-to publish the centre of its upper face in **camera optical-frame coordinates**
-(metres: X right, Y down, Z forward):
+`/oak/rgb/image_raw/compressed`, extracts the observed quadrilateral of its
+upper face (rather than the bounding rectangle of the complete cube), and uses
+`/oak/rgb/camera_info` and square PnP to publish the centre of that face in
+**camera optical-frame coordinates** (metres: X right, Y down, Z forward).
+The pose orientation contains the two in-plane face-edge directions and their
+right-handed normal:
+
+The detector selects the largest *square-like* yellow contour, not merely the
+largest yellow region; this rejects elongated yellow strips at the image edge.
 
 ```bash
 ros2 launch drims_homework yellow_dice_localizer_start.launch.py
@@ -106,13 +112,17 @@ It opens an OpenCV window by default and publishes `/yellow_dice/position`
 (`PointStamped`), the annotated `/yellow_dice/debug_image`, rectified
 `/yellow_dice/top_face`, the counted `/yellow_dice/face_number` (`Int32`),
 and `/yellow_dice/face_orientation_deg` (`Float64`, modulo 90 degrees).
+The face number is emitted after a three-frame pip-count consensus, so a
+single blurred or partially exposed image cannot replace a valid result.
 The separate **Yellow die masks** window shows the exact binary masks used for
 the yellow die, bright upper face, and locally high-contrast pips; they are also published as
 `/yellow_dice/die_mask`, `/yellow_dice/top_face_mask`, and
 `/yellow_dice/pip_mask`.
-Set `die_size_m` in
+`die_size_m` is set to `0.030` m for the supplied 3 cm die. Set it in
 [`config/yellow_dice_localizer_config.yaml`](config/yellow_dice_localizer_config.yaml)
-to the measured edge length of the physical die: this is required to obtain a
-metric 3D position from an RGB camera. The node intentionally only localizes
+if using another die: it directly sets the metric scale of the pose. Since a
+plain square has no unique visual yaw, the reported in-plane axes are a
+consistent canonical orientation; a face number such as 1, 4 or 5 cannot by
+itself remove every 90-degree ambiguity. The node intentionally only localizes
 the die; exposing it through the package's `dice_identification` service and
 recognizing the upper face are the next pipeline steps.

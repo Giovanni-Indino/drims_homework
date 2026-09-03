@@ -12,15 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Locate a yellow die and publish its metric pose in the camera frame.
+"""
+Localize the upper face of a yellow 30 mm die in the camera frame.
 
-The node segments the yellow die, fits a square to its contour, and estimates
-the square pose with ``cv2.solvePnP`` using the intrinsics in ``CameraInfo``.
-The position is therefore expressed in metres in the optical camera frame
-(x right, y down, z forward), rather than in image pixels.
+The processing deliberately separates the three perception products needed by
+the manipulation task: a measured quadrilateral for the upper face, a metric
+pose of that face from calibrated PnP, and its pip count.  In particular the
+face is *not* replaced by the bounding rectangle of the whole visible cube:
+that would make the reported centre depend on the visible side walls.
+
+``/yellow_dice/pose`` is the centre of the upper face in the optical camera
+frame (metres: X right, Y down, Z forward).  Its X/Y axes follow the ordered
+face edges and Z is their right-handed normal.  A plain, unmarked die has an
+inherent 90-degree yaw ambiguity; this is a canonical geometric frame, not an
+absolute body marking.
 """
 
-from typing import Optional, Tuple
+from collections import deque
+from typing import Deque, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -44,9 +53,10 @@ def order_corners(corners: np.ndarray) -> np.ndarray:
 
 
 def detect_yellow_square(image: np.ndarray, lower_hsv: np.ndarray,
-                         upper_hsv: np.ndarray, min_area_px: float
+                         upper_hsv: np.ndarray, min_area_px: float,
+                         min_square_aspect_ratio: float = 0.65
                          ) -> Tuple[Optional[np.ndarray], np.ndarray]:
-    """Find the largest yellow contour and return its square and mask."""
+    """Find the most square yellow contour and return its corners and mask."""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
     kernel = np.ones((5, 5), dtype=np.uint8)
@@ -57,11 +67,57 @@ def detect_yellow_square(image: np.ndarray, lower_hsv: np.ndarray,
     if not contours:
         return None, mask
 
-    contour = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(contour) < min_area_px:
+    candidates = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < min_area_px:
+            continue
+        _, (width, height), _ = cv2.minAreaRect(contour)
+        if width <= 0.0 or height <= 0.0:
+            continue
+        aspect_ratio = min(width, height) / max(width, height)
+        if aspect_ratio >= min_square_aspect_ratio:
+            candidates.append((area, contour))
+    if not candidates:
         return None, mask
+    contour = max(candidates, key=lambda candidate: candidate[0])[1]
     corners = cv2.boxPoints(cv2.minAreaRect(contour))
     return order_corners(corners), mask
+
+
+def contour_quadrilateral(contour: np.ndarray) -> np.ndarray:
+    """
+    Fit a convex quadrilateral, preferring the contour's actual corners.
+
+    ``minAreaRect`` is only a fallback.  It is useful for the complete cube
+    silhouette, but applying it unconditionally to the top face discards its
+    perspective and biases the 3-D centre toward a visible side wall.
+    """
+    perimeter = cv2.arcLength(contour, True)
+    approximation = cv2.approxPolyDP(contour, 0.015 * perimeter, True)
+    if len(approximation) == 4 and cv2.isContourConvex(approximation):
+        corners = approximation.reshape((-1, 2)).astype(np.float32)
+    else:
+        corners = cv2.boxPoints(cv2.minAreaRect(contour)).astype(np.float32)
+    return order_corners(corners)
+
+
+def refine_face_corners(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
+    """Refine a face quadrilateral on image gradients without changing order."""
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    initial = corners.reshape((-1, 1, 2)).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.05)
+    refined = cv2.cornerSubPix(gray, initial, (5, 5), (-1, -1), criteria)
+    if refined is None or not np.all(np.isfinite(refined)):
+        return corners
+    refined = refined.reshape((-1, 2))
+    # A corner may be attracted by a nearby pip or specular highlight.  Keep
+    # the contour estimate in that case instead of accepting a large jump.
+    if np.max(np.linalg.norm(refined - corners, axis=1)) > 4.0:
+        return corners
+    if abs(cv2.contourArea(refined.astype(np.float32))) < 10.0:
+        return corners
+    return order_corners(refined)
 
 
 def detect_top_face(image: np.ndarray, outer_corners: np.ndarray,
@@ -92,7 +148,8 @@ def detect_top_face(image: np.ndarray, outer_corners: np.ndarray,
     contour = max(contours, key=cv2.contourArea)
     if cv2.contourArea(contour) < 100.0:
         return None, bright_mask
-    return order_corners(cv2.boxPoints(cv2.minAreaRect(contour))), bright_mask
+    corners = contour_quadrilateral(contour)
+    return refine_face_corners(image, corners), bright_mask
 
 
 def rectify_face_and_count_pips(image: np.ndarray, corners: np.ndarray,
@@ -168,12 +225,14 @@ class YellowDiceLocalizer(Node):
         self.declare_parameter('face_number_topic', '/yellow_dice/face_number')
         self.declare_parameter(
             'face_orientation_topic', '/yellow_dice/face_orientation_deg')
-        self.declare_parameter('die_size_m', 0.025)
+        self.declare_parameter('die_size_m', 0.030)
         self.declare_parameter('top_face_min_value', 200)
         self.declare_parameter('top_face_brightness_percentile', 70.0)
+        self.declare_parameter('pip_consensus_frames', 3)
         self.declare_parameter('hsv_lower', [15, 80, 80])
         self.declare_parameter('hsv_upper', [32, 255, 255])
         self.declare_parameter('min_area_px', 200.0)
+        self.declare_parameter('min_square_aspect_ratio', 0.65)
         self.declare_parameter('publish_debug_image', True)
         self.declare_parameter('show_window', True)
         self.declare_parameter('window_name', 'Yellow die vision')
@@ -181,6 +240,7 @@ class YellowDiceLocalizer(Node):
 
         self._bridge = CvBridge()
         self._camera_info: Optional[CameraInfo] = None
+        self._pip_history: Deque[int] = deque(maxlen=5)
         result_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self._pose_pub = self.create_publisher(
             PoseStamped, self.get_parameter('pose_topic').value, result_qos)
@@ -230,7 +290,8 @@ class YellowDiceLocalizer(Node):
         upper = np.array(self.get_parameter('hsv_upper').value, dtype=np.uint8)
         outer_corners, die_mask = detect_yellow_square(
             image, lower, upper,
-            float(self.get_parameter('min_area_px').value))
+            float(self.get_parameter('min_area_px').value),
+            float(self.get_parameter('min_square_aspect_ratio').value))
         if outer_corners is None:
             self._publish_debug(
                 image, message, None, None, None, None, None, None, die_mask,
@@ -252,7 +313,7 @@ class YellowDiceLocalizer(Node):
         pip_count = len(pip_centers)
         image_pips = self._image_pip_centers(pip_centers, transform)
         angle = face_angle_degrees(corners)
-        face_number = pip_count if 1 <= pip_count <= 6 else None
+        face_number = self._stable_face_number(pip_count)
         self._publish_debug(
             image, message, outer_corners, corners, pose, face_number, angle,
             image_pips, die_mask, top_face_mask, pip_mask)
@@ -273,6 +334,22 @@ class YellowDiceLocalizer(Node):
         point.header = pose.header
         point.point = pose.pose.position
         self._point_pub.publish(point)
+
+    def _stable_face_number(self, pip_count: int) -> Optional[int]:
+        """
+        Return a face number only after a short, consistent observation.
+
+        A partial JPEG frame can temporarily hide one or more black pips.  A
+        three-frame consensus preserves the low latency of the detector while
+        preventing a single imperfect frame from being published as a real
+        face change.
+        """
+        if not 1 <= pip_count <= 6:
+            return None
+        self._pip_history.append(pip_count)
+        required = max(1, int(self.get_parameter('pip_consensus_frames').value))
+        occurrences = sum(count == pip_count for count in self._pip_history)
+        return pip_count if occurrences >= required else None
 
     @staticmethod
     def _image_pip_centers(pip_centers: np.ndarray,
@@ -316,6 +393,12 @@ class YellowDiceLocalizer(Node):
             return None
 
         rotation_matrix, _ = cv2.Rodrigues(rotation)
+        # OpenCV's image-corner order makes its plane normal point away from
+        # the camera.  For an upper face that is the inward cube normal.  Keep
+        # the first edge direction and reverse the other two axes so pose +Z
+        # is the physical, outward normal of the upper face.
+        rotation_matrix[:, 1] *= -1.0
+        rotation_matrix[:, 2] *= -1.0
         quaternion = self._quaternion_from_matrix(rotation_matrix)
         pose = PoseStamped()
         pose.header = image_message.header
@@ -374,7 +457,9 @@ class YellowDiceLocalizer(Node):
                           (0, 0, 0), 2)
             center = np.mean(corners, axis=0)
             x_axis = (corners[1] + corners[2]) / 2.0 - center
-            y_axis = (corners[2] + corners[3]) / 2.0 - center
+            # This is the same face-Y direction published in PoseStamped;
+            # face +Z is outward, toward the camera above the table.
+            y_axis = (corners[0] + corners[1]) / 2.0 - center
             origin = tuple(np.round(center).astype(int))
             x_end = tuple(np.round(center + 0.7 * x_axis).astype(int))
             y_end = tuple(np.round(center + 0.7 * y_axis).astype(int))
