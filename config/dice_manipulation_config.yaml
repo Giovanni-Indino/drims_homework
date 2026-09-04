@@ -46,16 +46,19 @@ dice_manipulation_node:
     # body itself colliding with something. Picking is unavoidably wherever
     # the dice is; releasing does not have to be.
     #
-    # Given in `release_frame` below (base_link = "on the table in front of
-    # the robot", the same convention as drims_dice_simulator's spawn
-    # `position`); the node resolves it to `world` once at start-up via TF
-    # (base_link -> world carries a real yaw on this cell -- see
-    # configuration_cell_1.yaml `rpy "0 0 -1.57"` -- so it is NOT a bare
-    # X/Y copy; see _resolve_release_xy()). [0.0, 0.7] in base_link is
-    # roughly the middle of the table on ur5e_1 (same spot the dice was
-    # spawned at for testing). Confirm against RViz near a physical barrier.
-    release_position: [0.0, 0.7]
-    release_frame: "base_link"
+    # Given directly in `world` (release_frame below), anchored on the
+    # exact centre of the table top -- not an estimate: drims_description's
+    # ur5e_cell.urdf.xacro anchors `table_corner` to `world` with a zero
+    # offset (`world_to_table_corner`), and the table box is
+    # `table_length` x `table_width` starting at that corner (see the
+    # xacro's "TABLE" section) -- so the centre in `world`/`table_corner`
+    # X/Y is exactly (table_length/2, table_width/2). For ur5e_1
+    # (configuration_cell_1.yaml: length 1.2, width 0.84) that is
+    # [0.6, 0.42] -- Y nudged +0.05 from there (0.42 -> 0.47) per request.
+    # If you switch to a cell with a different table size, recompute the
+    # centre from its own configuration_cell_N.yaml and re-apply the nudge.
+    release_position: [0.6, 0.47]
+    release_frame: "world"
 
     # Note: there used to be an align_grip_before_roll/align_tolerance_deg
     # pair here, for a post-lift yaw that squared the gripper's jaws to

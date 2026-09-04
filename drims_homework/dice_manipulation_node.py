@@ -773,17 +773,14 @@ def _declare_parameters(node: Node) -> None:
     node.declare_parameter('gripper_settle_time', 1.0)
     # Fixed (X, Y) every roll carries the dice to before releasing -- see
     # roll_dice()'s and the module docstring's "Why release always happens
-    # at a fixed spot": wherever the dice was actually picked up from can
-    # be close to a table edge or cell barrier, so releasing there risks
-    # the gripper body colliding with something as it opens. Given in
-    # ``release_frame`` (default ``base_link``: "somewhere on the table in
-    # front of the robot", the same convention as drims_dice_simulator's
-    # spawn ``position``) and resolved to ``world_frame`` at start-up, see
-    # _resolve_release_xy(). Tune for your own cell -- well clear of every
-    # barrier/edge, comfortably reachable in a top-down-ish orientation
-    # from any picked-up face; confirm against the real/sim TF.
-    node.declare_parameter('release_position', [0.0, 0.7])
-    node.declare_parameter('release_frame', 'base_link')
+    # at a fixed spot". Default is the ur5e_1 table top's centre in
+    # `world` (table_length/2, table_width/2 -- see
+    # dice_manipulation_config.yaml for the derivation from
+    # ur5e_cell.urdf.xacro / configuration_cell_1.yaml), Y nudged +0.05.
+    # Given in ``release_frame`` and resolved to ``world_frame`` at
+    # start-up if different, see _resolve_release_xy(). Tune per cell.
+    node.declare_parameter('release_position', [0.6, 0.47])
+    node.declare_parameter('release_frame', 'world')
 
     # Which fixed world axis the roll turns about ('x' or 'y') and by how
     # much (deg). Normally overridden at runtime (via set_parameters) by
