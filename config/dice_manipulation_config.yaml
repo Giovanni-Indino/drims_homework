@@ -22,8 +22,12 @@ dice_manipulation_node:
     gripper_settle_time: 1.0
 
     # --- Pick / place geometry (meters) ------------------------------
-    approach_distance: 0.10   # pre-grasp height above the table
-    grasp_offset: 0.0         # extra Z at the grasp pose (+ = higher)
+    approach_distance: 0.10   # pre-grasp height above the die (unchanged -- fine as a hover height)
+    # Stop 1.5 cm short of the die surface (dice_tf origin), not flush:
+    # descending the full approach_distance (10 cm) all the way to the
+    # die was hitting a collision. Net descent onto the die is now
+    # approach_distance - grasp_offset = 8.5 cm.
+    grasp_offset: 0.015       # extra Z at the grasp pose (+ = higher)
     # How much the dice is lifted before rolling -- this is also the
     # height at which the roll itself happens (roll_dice() keeps Z fixed
     # at table_z + lift_distance while it rotates+translates). Bumped up
@@ -36,8 +40,9 @@ dice_manipulation_node:
     # Clearance kept above the table when releasing (never touch down
     # exactly -- see release_after_roll()'s docstring): small enough that
     # releasing from there is a negligible drop, large enough that the
-    # wrist/gripper never drives into the table. Raised by 1 cm (was 0.02).
-    place_safety_height: 0.03
+    # wrist/gripper never drives into the table. Lowered by 1 cm again
+    # (was 0.03) -- release wanted 1 cm closer to the table.
+    place_safety_height: 0.02
     # Fixed (X, Y) EVERY roll carries the dice to, in the same move as the
     # rotation, before releasing -- see dice_manipulation_node's module
     # docstring, "Why release always happens at a fixed spot": wherever the

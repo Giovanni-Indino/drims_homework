@@ -143,6 +143,7 @@ from typing import Optional, Tuple
 
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
 
 from geometry_msgs.msg import PoseStamped
 from std_srvs.srv import Trigger
@@ -187,11 +188,12 @@ class DiceManipulator:
         self._log = node.get_logger()
 
         # Dedicated node for every blocking call this class makes
-        # (/dice_identification). Must NOT be `node`: `node` is what
-        # rclpy.spin(node) owns once main() starts serving
-        # ~/pick_rotate_place, so spin_until_future_complete(node, ...)
-        # from inside that very callback would reenter node's own
-        # executor and deadlock. client_node is never spun persistently,
+        # (/dice_identification). Must NOT be `node`: `node` is added to
+        # its own executor once main() starts serving ~/pick_rotate_place
+        # (see main()'s comment on why that executor is private, not
+        # rclpy's implicit global one), so spin_until_future_complete(node,
+        # ...) from inside that very callback would reenter that executor
+        # and deadlock. client_node is never spun persistently,
         # so each blocking call gets its own private, non-reentrant spin
         # (same pattern MotionClient itself uses internally).
         self._client_node = client_node
@@ -301,7 +303,7 @@ class DiceManipulator:
         result.val = MoveItErrorCodes.FAILURE
         return result
 
-    def _safe_call(self, description: str, fn, timeout: float = 20.0,
+    def _safe_call(self, description: str, fn, timeout: float = 50.0,
                    retries: int = 3, retry_delay: float = 0.5, default=None):
         """
         Call a zero-argument MotionClient wrapper with two safety nets.
@@ -480,12 +482,13 @@ class DiceManipulator:
 
         self.close_gripper()
 
-        attached = self._safe_call(
-            'attach_object',
-            lambda: self._motion.attach_object(self.object_id, self.attach_frame),
-            default=False)
-        self._log.info(f'attach_object({self.object_id}) -> {attached}')
-        return bool(attached)
+        # attached = self._safe_call(
+        #     'attach_object',
+        #     lambda: self._motion.attach_object(self.object_id, self.attach_frame),
+        #     default=False)
+        # self._log.info(f'attach_object({self.object_id}) -> {attached}')
+        # return bool(attached)
+        return True 
 
     def lift(self) -> bool:
         up = self._pose(self.world_frame, (0.0, 0.0, self.lift_distance),
@@ -755,19 +758,25 @@ def _declare_parameters(node: Node) -> None:
 
     node.declare_parameter('home_joints', [0.0, -1.97, 2.13, -1.83, -1.50, 0.0])
     node.declare_parameter('gripper_open', 0.045)
-    node.declare_parameter('gripper_close', 0.0)
-    node.declare_parameter('gripper_max_effort', 20.0)
+    node.declare_parameter('gripper_close', 0.029)
+    node.declare_parameter('gripper_max_effort', 10.0)
 
+    # Pre-grasp height above the die, in dice_grasp_frame -- kept at 10 cm,
+    # it's a fine hover height on its own.
     node.declare_parameter('approach_distance', 0.10)
-    node.declare_parameter('grasp_offset', 0.0)
+    # Stop grasp_offset short of the die surface (dice_tf origin), not
+    # flush with it: descending the full approach_distance all the way to
+    # the die was hitting a collision. Net cartesian descent onto the die
+    # in pick_dice() is approach_distance - grasp_offset = 8.5 cm.
+    node.declare_parameter('grasp_offset', 0.015)
     # See dice_manipulation_config.yaml for why these two defaults were
     # bumped up from 0.15/0.02 (diagnosing why 'y' rolls were never
     # observed to succeed).
     node.declare_parameter('lift_distance', 0.20)
     # Clearance kept above the table when releasing -- never touch down
-    # exactly (see release_after_roll()/place_dice()). Raised by 1 cm
-    # (0.02 -> 0.03) -- release was too close to the table.
-    node.declare_parameter('place_safety_height', 0.03)
+    # exactly (see release_after_roll()/place_dice()). Lowered by 1 cm
+    # again (0.03 -> 0.02): release wanted 1 cm closer to the table.
+    node.declare_parameter('place_safety_height', 0.02)
     # Seconds to hold still after a gripper open/close command, so the
     # jaws physically settle / the die actually falls before the next move.
     node.declare_parameter('gripper_settle_time', 1.0)
@@ -791,7 +800,7 @@ def _declare_parameters(node: Node) -> None:
     # dice_face_map.CANDIDATE_ROLLS. Overridden per-call by the orchestrator.
     node.declare_parameter('roll_angle_deg', 60.0)
 
-    node.declare_parameter('velocity_scaling', 0.3)
+    node.declare_parameter('velocity_scaling', 1.0)
     node.declare_parameter('identify_after', True)
     node.declare_parameter('run_on_start', False)
 
@@ -809,7 +818,7 @@ def main(args=None):
 
     # Never spun in a persistent loop -- see the comment in
     # DiceManipulator.__init__ for why this must be a separate node from
-    # `node` (which rclpy.spin(node) below takes ownership of).
+    # `node` (which gets its own private executor below).
     client_node = rclpy.create_node('dice_manipulation_node_clients')
 
     motion = MotionClient(
@@ -836,14 +845,38 @@ def main(args=None):
     node.get_logger().info(
         'dice_manipulation_node ready (service: ~/pick_rotate_place, std_srvs/Trigger)')
 
+    # `node` gets its OWN executor here instead of the bare rclpy.spin(node)
+    # this used to be -- that implicitly uses rclpy's process-wide global
+    # executor (rclpy.get_global_executor()), same as every bare
+    # rclpy.spin_until_future_complete(...) call with no executor= given.
+    # `easy_motion.MotionClient` (== `motion` above) IS a Node and calls
+    # exactly that, with no executor, from the *background thread*
+    # `_safe_call()` spawns for every motion command. Normally the main
+    # thread is just blocked on `queue.get()` while that runs, so there is
+    # no conflict -- but if a call is ever abandoned on `_safe_call()`'s
+    # timeout (motion server slow/stuck: "no response after Ns; giving up
+    # ... background thread left running, best-effort"), that background
+    # thread stays inside its own spin on the global executor. The main
+    # thread then returns control to its own spin loop -- if that loop is
+    # ALSO the global executor (bare rclpy.spin(node)), the two threads
+    # race to iterate the same executor's internal generator and rclpy
+    # raises `ValueError: generator already executing`, killing this whole
+    # process over one slow motion call (observed in practice). Giving
+    # `node` a private executor removes it from that shared pool entirely,
+    # so an abandoned motion call now just means this one roll fails
+    # (dice_task_orchestrator already treats 'failed to reach home' etc.
+    # as recoverable/retryable) instead of taking the node down.
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
     try:
         if node.get_parameter('run_on_start').value:
             ok, message = manipulator.pick_rotate_place()
             node.get_logger().info(f'run_on_start result: {ok} ({message})')
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
+        executor.remove_node(node)
         motion.destroy_node()
         client_node.destroy_node()
         node.destroy_node()

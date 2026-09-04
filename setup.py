@@ -32,6 +32,7 @@ setup(
             'ask_face = drims_homework.ask_face:main',
             'dice_simulator_healer = drims_homework.dice_simulator_healer:main',
             'yellow_dice_localizer = drims_homework.yellow_dice_localizer:main',
+            'dice_localizer_stable = drims_homework.dice_localizer_stable:main',
         ],
     },
 )

@@ -1,0 +1,37 @@
+dice_detector_node:
+  ros__parameters:
+    # --- Camera input ----------------------------------------------------
+    image_topic: "/oak/rgb/image_raw/compressed"
+    camera_info_topic: "/oak/rgb/camera_info"
+
+    # Height (m) of the table/die-top plane along the camera's own optical
+    # Z axis, used by calculate_position() to ray-cast a detected pixel
+    # onto that plane. Calibrated per physical setup -- NOT a guess:
+    #   Setup 1: 0.585
+    #   Setup 2: 0.625
+    # Re-measure for your own camera mount if neither matches.
+    board_z: 0.585
+
+    show_debug_windows: false
+
+    # --- Yellow-die HSV thresholds ----------------------------------------
+    yellow_h_min: 18
+    yellow_h_max: 35
+    yellow_s_min: 100
+    yellow_v_min: 80
+
+    minimum_dice_area: 300.0
+    pip_max_value: 120
+
+    # --- dice_identification / dice_manipulation_node integration --------
+    # Must match dice_manipulation_node's own `world_frame` /
+    # `dice_grasp_frame` (dice_manipulation_config.yaml) -- this node
+    # transforms every detection into `world_frame` (via the hand-eye
+    # calibration TF published by camera_calibration_cellN.launch.py, see
+    # ur5e_N_start.launch.py with fake:=false) and continuously broadcasts
+    # it as `dice_tf_frame`, which is what dice_manipulation_node actually
+    # grasps against. See dice_localizer_stable.py's _pose_to_world() /
+    # _broadcast_dice_tf() docstrings.
+    world_frame: "world"
+    dice_tf_frame: "dice_tf"
+    publish_dice_tf: true

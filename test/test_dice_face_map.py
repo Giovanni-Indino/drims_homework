@@ -112,11 +112,17 @@ def _simulated_identification(q_die_world, body_normals=STANDARD_BODY_NORMALS):
 # apply_roll / DiceOrientation.rolled                                 #
 # ------------------------------------------------------------------ #
 def test_apply_roll_x90_moves_up_to_minus_y():
-    assert apply_roll(ROLL_X, (0, 0, 1)) == (0, -1, 0)
+    # Pins apply_roll()'s own geometric law for a literal move, independent
+    # of whichever sign combo CANDIDATE_ROLLS currently picks.
+    assert apply_roll(('x', 90.0), (0, 0, 1)) == (0, -1, 0)
 
 
 def test_apply_roll_y_minus90_moves_up_to_minus_x():
-    assert apply_roll(ROLL_Y, (0, 0, 1)) == (-1, 0, 0)
+    assert apply_roll(('y', -90.0), (0, 0, 1)) == (-1, 0, 0)
+
+
+def test_apply_roll_y_plus90_moves_up_to_plus_x():
+    assert apply_roll(('y', 90.0), (0, 0, 1)) == (1, 0, 0)
 
 
 def test_apply_roll_is_a_proper_quarter_turn_period_four():

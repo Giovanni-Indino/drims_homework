@@ -128,11 +128,13 @@ Quat = Tuple[float, float, float, float]  # (x, y, z, w)
 # Rolls dice_manipulation_node knows how to execute, each a quarter turn
 # about a FIXED WORLD axis, with the die never yawed about world Z at any
 # point in the sequence (see dice_manipulation_node's module docstring).
-# Only 2 of the 4 geometrically-possible combinations: live testing on
-# this cell's arm/gripper found the other two over-rotate the wrist
-# towards a near-singular configuration. Tune per cell/robot -- see this
-# module's docstring for why both are still enough to reach every face
-# from every orientation.
+# Only 2 of the 4 geometrically-possible combinations. The 'y' sign was
+# flipped from -60 to +60: live testing found the negative direction
+# drives the wrist/gripper into a collision from this cell's pick
+# orientation, so it was never actually completed. Tune per cell/robot --
+# see this module's docstring for why both are still enough to reach
+# every face from every orientation (verified below for whichever sign
+# combo is configured, not assumed).
 #
 # Only the *sign* of the angle is ever read here (apply_roll()): the
 # planning geometry always treats a roll as an exact 90 deg quarter turn.
@@ -142,7 +144,7 @@ Quat = Tuple[float, float, float, float]  # (x, y, z, w)
 # face, which keeps the wrist away from the configuration where a full
 # 90 deg sweep was failing. If the die does not reliably complete the
 # tip on your cell, raise these back towards +-90.
-CANDIDATE_ROLLS: List[Move] = [('x', 60.0), ('y', -60.0)]
+CANDIDATE_ROLLS: List[Move] = [('x', 60.0), ('y', 60.0)]
 
 # This die's numbering: which body axis each face sits on. Opposite faces
 # sum to 7 (a standard die), and the specific signs/axes below match
