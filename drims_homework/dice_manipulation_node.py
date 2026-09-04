@@ -425,7 +425,17 @@ class DiceManipulator:
         of extra yaw about ``dice_tf``'s own Z -- which *is* world Z
         here) are the only two that can possibly matter; picking by exact
         dot product is not an approximation.
+
+        ``roll_axis == 'z'`` is the one exception: ``dice_task_orchestrator``
+        uses it, once, to straighten a die found with residual yaw before
+        it ever calibrates (see that module's docstring) -- there is no
+        roll axis to line the jaws up with yet, so this returns the flush
+        0 deg grasp directly rather than running the scoring below, which
+        also means the straightening roll lands the die at *exactly*
+        world yaw 0 (not merely some other axis-aligned multiple of 90).
         """
+        if roll_axis == 'z':
+            return GRASP_DOWN_QUAT
         target = (1.0, 0.0, 0.0) if roll_axis == 'x' else (0.0, 1.0, 0.0)
         best_quat, best_score = GRASP_DOWN_QUAT, -1.0
         for psi in (0.0, math.pi / 2.0):
@@ -506,13 +516,24 @@ class DiceManipulator:
         ``/dice_identification`` at pick time (valid for any face, see
         ``pick_rotate_place()``). Returns the resulting world-frame tool
         orientation, or None on failure.
+
+        ``roll_axis == 'z'`` is accepted too, purely so
+        ``dice_task_orchestrator`` can drive its one-time pre-calibration
+        de-yaw straightening through this exact same
+        set_parameters/~pick_rotate_place path -- see that module's
+        docstring. ``CANDIDATE_ROLLS``/planning never produce ``'z'``, so
+        this never happens as part of an actual face-changing roll; the
+        module docstring's "never yawed about world Z" invariant is about
+        that roll-execution path, not this narrow, explicit exception.
         """
         axis, angle_deg = self._current_roll()
-        if axis not in ('x', 'y'):
-            self._log.error(f"roll_axis={axis!r} must be 'x' or 'y'")
+        if axis not in ('x', 'y', 'z'):
+            self._log.error(f"roll_axis={axis!r} must be 'x', 'y' or 'z'")
             return None
 
-        axis_vec = (1.0, 0.0, 0.0) if axis == 'x' else (0.0, 1.0, 0.0)
+        axis_vec = {'x': (1.0, 0.0, 0.0),
+                    'y': (0.0, 1.0, 0.0),
+                    'z': (0.0, 0.0, 1.0)}[axis]
         roll_delta = quaternion_about_axis(math.radians(angle_deg), axis_vec)
         # Extrinsic (world-frame) rotation on top of the current
         # orientation -- left-multiplied, unlike a body-relative roll.
@@ -744,10 +765,9 @@ def _declare_parameters(node: Node) -> None:
     # observed to succeed).
     node.declare_parameter('lift_distance', 0.20)
     # Clearance kept above the table when releasing -- never touch down
-    # exactly (see release_after_roll()/place_dice()). Lowered back to 0.02
-    # so the die is dropped from closer to the table (less bounce/roll on
-    # release).
-    node.declare_parameter('place_safety_height', 0.02)
+    # exactly (see release_after_roll()/place_dice()). Raised by 1 cm
+    # (0.02 -> 0.03) -- release was too close to the table.
+    node.declare_parameter('place_safety_height', 0.03)
     # Seconds to hold still after a gripper open/close command, so the
     # jaws physically settle / the die actually falls before the next move.
     node.declare_parameter('gripper_settle_time', 1.0)

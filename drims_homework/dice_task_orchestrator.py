@@ -70,7 +70,14 @@ a mere prediction over what was actually observed).
   ``dice_common.py``) which face is currently up.
 * **CALIBRATE** (only entered when the tracked orientation is missing or
   stale) performs exactly one roll purely to (re)establish the full
-  layout -- see above.
+  layout -- see above. If the die is found yawed off world Z at this
+  point, it is straightened to yaw 0 first, with one extra roll about a
+  world-Z axis ``dice_manipulation_node`` accepts only for this -- see
+  ``_calibrate()``. This is the *only* place in this node that ever
+  looks at the perception layer's reported orientation (still never for
+  reconstructing the six-face layout itself, only to decide whether
+  straightening is needed) and the only place a world-Z roll is ever
+  commanded.
 * **CHECK_TARGET** compares the current up face to ``target_face``; also
   where the ``max_attempts`` budget is enforced.
 * **PLAN** asks ``dice_face_map.plan_min_sequence()`` -- pure geometry,
@@ -98,9 +105,11 @@ exploration done via one shows up in the other.
 This node only ever talks to two contracts:
 
     * ``/dice_identification`` (perception — the simulator today, a real
-      vision node tomorrow, see ``dice_common.py``) -- and only ever
-      reads its ``face_number``, never trusting its orientation for
-      layout purposes (see "Calibration" above);
+      vision node tomorrow, see ``dice_common.py``) -- ``face_number``
+      drives everything; the reported orientation is read in exactly one
+      place (``_calibrate()``'s de-yaw pre-step, to decide whether the
+      die needs straightening) and never trusted for reconstructing the
+      six-face layout itself (see "Calibration" above);
     * ``dice_manipulation_node``'s ``set_parameters`` and
       ``~/pick_rotate_place`` services.
 
@@ -133,18 +142,35 @@ To change the target at runtime without restarting::
     ros2 service call /dice_task_orchestrator/execute_planned_sequence std_srvs/srv/Trigger "{}"
 """
 
+import math
 from enum import Enum, auto
 from typing import Optional, Set, Tuple
 
 import rclpy
 from rclpy.node import Node
 
+from geometry_msgs.msg import PoseStamped
 from std_srvs.srv import Trigger
 from rcl_interfaces.srv import SetParameters
 from rclpy.parameter import Parameter
 
 from drims_homework.dice_common import create_dice_identification_client, identify_dice
 from drims_homework.dice_face_map import CANDIDATE_ROLLS, DiceOrientation, Move, plan_min_sequence
+
+
+def _yaw_from_quat(q) -> float:
+    """
+    World-Z yaw (rad) of a ``geometry_msgs/Quaternion``, assumed close to flat.
+
+    Standard ZYX-Euler yaw extraction. Used only by ``_calibrate()``'s
+    pre-straightening step, to answer "is this die close enough to
+    axis-aligned to grasp/roll cleanly" -- a much weaker question than
+    reconstructing the die's six-face layout from a single reading,
+    which stays exclusively face-number-based (``from_two_faces()``, see
+    the module docstring's "Calibration") because a real vision node's
+    yaw is not trustworthy for that.
+    """
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
 
 # pick_rotate_place() failure messages that mean the dice was never
 # touched, or the roll layer itself already gave up recovering -- not
@@ -190,6 +216,9 @@ class DiceTaskOrchestrator:
         gp = node.get_parameter
         self.manipulation_node_name = gp('manipulation_node_name').value
         self.max_attempts = gp('max_attempts').value
+        # See _calibrate()'s de-yaw pre-step: below this the die is
+        # considered already at yaw 0 and straightening is skipped.
+        self.deyaw_tolerance_deg = gp('deyaw_tolerance_deg').value
 
         self._dice_identification_client = create_dice_identification_client(
             self._client_node, gp('dice_identification_service').value)
@@ -268,6 +297,21 @@ class DiceTaskOrchestrator:
             return None
         return face
 
+    def _identify(self) -> Tuple[Optional[int], Optional[PoseStamped]]:
+        """
+        Identify the die; return ``(face_number, pose)``.
+
+        Unlike ``_identify_face()``, also hands back the raw pose --
+        used only right before a possible ``CALIBRATE``/``_calibrate()``
+        (see ``plan_target_face()`` and ``reach_target_face()``'s
+        ``IDENTIFY`` state), and only so ``_calibrate()`` can measure the
+        die's current yaw about world Z for its one-time straightening
+        pre-step. Every other identification in this module still goes
+        through ``_identify_face()`` and never looks at the pose, per
+        the module docstring's "Calibration".
+        """
+        return identify_dice(self._client_node, self._dice_identification_client)
+
     # ------------------------------------------------------------------ #
     # Shared roll execution (used by both the automatic state machine    #
     # and the interactive plan/execute pair below)                       #
@@ -329,7 +373,7 @@ class DiceTaskOrchestrator:
             self._log.warn(f'pick_rotate_place failed ({message}); re-checking state.')
         return 'recoverable', message
 
-    def _calibrate(self, face: int) -> Tuple[Optional[int], str]:
+    def _calibrate(self, face: int, pose: Optional[PoseStamped] = None) -> Tuple[Optional[int], str]:
         """
         (Re-)establish the die's full tracked orientation with one physical roll.
 
@@ -339,7 +383,39 @@ class DiceTaskOrchestrator:
         ``(face, move, new_face)`` via ``from_two_faces()`` on success.
         Returns ``(new_face, '')`` on success or ``(None, error)`` if
         every candidate failed.
+
+        If ``pose`` is given and its yaw is more than
+        ``deyaw_tolerance_deg`` off world Z, the die is straightened to
+        yaw 0 *first* -- one extra physical roll, about the synthetic
+        ``'z'`` axis ``dice_manipulation_node.roll_dice()`` accepts only
+        for this (see its docstring) -- before any ``CANDIDATE_ROLLS``
+        attempt. This runs only here, i.e. only the first time (or the
+        first time again after a desync) this node has to work out how
+        the die is actually laid out before it can plan: every other
+        roll in this module is a normal ``'x'``/``'y'`` face-changing
+        roll and never touches yaw. A failed straightening roll is not
+        fatal -- calibration still proceeds on whatever face resulted,
+        only a ``'hard'`` failure (arm/perception genuinely broken)
+        aborts calibration entirely.
         """
+        if pose is not None:
+            yaw_deg = math.degrees(_yaw_from_quat(pose.pose.orientation))
+            if abs(yaw_deg) > self.deyaw_tolerance_deg:
+                self._log.info(
+                    f'Die yaw={yaw_deg:+.1f} deg off world Z; straightening to 0 '
+                    f'before calibrating.')
+                outcome, message = self._try_roll(None, ('z', -yaw_deg))
+                if outcome == 'hard':
+                    return None, f'de-yaw roll failed: {message}'
+                new_face = self._identify_face()
+                if new_face is None:
+                    return None, 'post-deyaw dice identification failed'
+                if outcome != 'ok':
+                    self._log.warn(
+                        f'De-yaw roll did not complete cleanly ({message}); '
+                        f'calibrating anyway from face {new_face}.')
+                face = new_face
+
         for move in CANDIDATE_ROLLS:
             outcome, message = self._try_roll(None, move)
             if outcome == 'hard':
@@ -381,12 +457,12 @@ class DiceTaskOrchestrator:
         if not 1 <= target_face <= 6:
             return False, f'invalid target_face={target_face} (must be 1-6)'
 
-        face = self._identify_face()
+        face, pose = self._identify()
         if face is None:
             return False, 'dice identification failed'
 
         if self._orientation is None or self._orientation.up_face != face:
-            face, err = self._calibrate(face)
+            face, err = self._calibrate(face, pose)
             if face is None:
                 self._pending_target = None
                 return False, err
@@ -476,13 +552,14 @@ class DiceTaskOrchestrator:
 
         state = State.IDENTIFY
         face: Optional[int] = None
+        pose: Optional[PoseStamped] = None
         move: Optional[Move] = None
         fail_reason = ''
         attempts = 0
 
         while True:
             if state == State.IDENTIFY:
-                face = self._identify_face()
+                face, pose = self._identify()
                 if face is None:
                     state = State.FAILED
                     fail_reason = 'dice identification failed'
@@ -492,7 +569,7 @@ class DiceTaskOrchestrator:
                     state = State.CHECK_TARGET
 
             elif state == State.CALIBRATE:
-                new_face, err = self._calibrate(face)
+                new_face, err = self._calibrate(face, pose)
                 if new_face is None:
                     state = State.FAILED
                     fail_reason = err
@@ -574,6 +651,9 @@ def _declare_parameters(node: Node) -> None:
     # bounds runaway retries on a persistently misbehaving cell, not
     # normal operation.
     node.declare_parameter('max_attempts', 15)
+    # See _calibrate()'s de-yaw pre-step: below this (deg) the die is
+    # considered already at yaw 0 and straightening is skipped.
+    node.declare_parameter('deyaw_tolerance_deg', 1.0)
     node.declare_parameter('manipulation_node_name', 'dice_manipulation_node')
     node.declare_parameter('dice_identification_service', 'dice_identification')
     node.declare_parameter('run_on_start', False)
