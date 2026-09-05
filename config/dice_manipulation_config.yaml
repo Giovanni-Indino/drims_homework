@@ -15,7 +15,7 @@ dice_manipulation_node:
 
     # --- Gripper (hand-e, meters) -------------------------------------
     gripper_open: 0.045
-    gripper_close: 0.0
+    gripper_close: 0.020
     gripper_max_effort: 20.0
     # Seconds held still after every gripper open/close, so the jaws settle
     # and the die actually falls/is gripped before the next move starts.
@@ -27,7 +27,7 @@ dice_manipulation_node:
     # descending the full approach_distance (10 cm) all the way to the
     # die was hitting a collision. Net descent onto the die is now
     # approach_distance - grasp_offset = 8.5 cm.
-    grasp_offset: 0.015       # extra Z at the grasp pose (+ = higher)
+    grasp_offset: 0.007       # extra Z at the grasp pose (+ = higher)
     # How much the dice is lifted before rolling -- this is also the
     # height at which the roll itself happens (roll_dice() keeps Z fixed
     # at table_z + lift_distance while it rotates+translates). Bumped up
@@ -42,7 +42,17 @@ dice_manipulation_node:
     # releasing from there is a negligible drop, large enough that the
     # wrist/gripper never drives into the table. Lowered by 1 cm again
     # (was 0.03) -- release wanted 1 cm closer to the table.
-    place_safety_height: 0.02
+    place_safety_height: 0.007
+    # Residual world-Z yaw (deg, from the die's nearest clean multiple of
+    # 90) below which roll_dice() ignores it; above it, cancelled in the
+    # same pick-lift-roll-place cycle as the requested roll, before the
+    # roll itself (never a separate straighten-then-reroll trip, which
+    # would risk picking up fresh yaw on its own intermediate release --
+    # see roll_dice()'s docstring). Runs on every 'x'/'y' roll, not just
+    # dice_task_orchestrator's own one-time pre-calibration de-yaw (its
+    # deyaw_tolerance_deg), which stays as the explicit first-ever
+    # straightening when nothing is tracked yet.
+    deyaw_tolerance_deg: 10.0
     # Fixed (X, Y) EVERY roll carries the dice to, in the same move as the
     # rotation, before releasing -- see dice_manipulation_node's module
     # docstring, "Why release always happens at a fixed spot": wherever the
@@ -59,10 +69,11 @@ dice_manipulation_node:
     # xacro's "TABLE" section) -- so the centre in `world`/`table_corner`
     # X/Y is exactly (table_length/2, table_width/2). For ur5e_1
     # (configuration_cell_1.yaml: length 1.2, width 0.84) that is
-    # [0.6, 0.42] -- Y nudged +0.05 from there (0.42 -> 0.47) per request.
+    # [0.6, 0.42] -- Y nudged +0.05 then a further +0.02 from there
+    # (0.42 -> 0.47 -> 0.49) per request.
     # If you switch to a cell with a different table size, recompute the
     # centre from its own configuration_cell_N.yaml and re-apply the nudge.
-    release_position: [0.6, 0.47]
+    release_position: [0.6, 0.49]
     release_frame: "world"
 
     # Note: there used to be an align_grip_before_roll/align_tolerance_deg
@@ -91,10 +102,15 @@ dice_manipulation_node:
     # sign of this angle. Normally overridden at runtime by the orchestrator
     # (from dice_face_map.CANDIDATE_ROLLS, also 60). Raise back towards 90
     # if the die does not reliably complete the tip.
-    roll_angle_deg: 60.0
+    roll_angle_deg: 65.0
 
     # --- Execution -------------------------------------------------------
-    velocity_scaling: 0.3
+    # No per-call velocity_scaling here anymore: every move (including
+    # go_home) now runs at the MotionClient default (1.0), and the actual
+    # speed cap is motion_server_node's own `safety_velocity_scaling`
+    # (drims_description/config/ur5e/motion_server_config.yaml, applied to
+    # every trajectory regardless of caller) -- one place to tune speed,
+    # not two disagreeing ones.
     identify_after: true      # re-run /dice_identification at the end
     # false: wait to be driven via ~/pick_rotate_place (e.g. by
     # dice_task_orchestrator, or "ros2 service call ... std_srvs/srv/Trigger

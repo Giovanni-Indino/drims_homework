@@ -179,6 +179,24 @@ def _rotate_vector(v: Xyz, q: Quat) -> Xyz:
     return (x, y, z)
 
 
+def _yaw_error_deg(q: Quat) -> float:
+    """
+    Signed offset (deg, in ``(-45, 45]``) of ``q`` from its *nearest*
+    multiple-of-90-deg world-Z yaw.
+
+    Standard ZYX-Euler yaw extraction (mirrors
+    ``dice_task_orchestrator._yaw_from_quat()``), then wrapped to the
+    nearest 90 deg rather than to 0: a die is 4-fold symmetric about Z, so
+    a die actually sitting cleanly at (say) 178 deg is 2 deg off its own
+    nearest clean state (180), not 178 deg off "true" 0 -- reporting the
+    latter would make ``roll_dice()`` below spend a wasteful ~178 deg
+    correction fixing something that was not actually crooked.
+    """
+    yaw_deg = math.degrees(math.atan2(
+        2.0 * (q[3] * q[2] + q[0] * q[1]), 1.0 - 2.0 * (q[1] * q[1] + q[2] * q[2])))
+    return ((yaw_deg + 45.0) % 90.0) - 45.0
+
+
 class DiceManipulator:
     """Stateless-ish helper that turns high level steps into motion calls."""
 
@@ -215,6 +233,10 @@ class DiceManipulator:
         self.lift_distance = gp('lift_distance').value
         self.place_safety_height = gp('place_safety_height').value
         self.gripper_settle_time = gp('gripper_settle_time').value
+        # See roll_dice()'s de-yaw step: below this (deg, from the nearest
+        # multiple of 90) the die's residual yaw is ignored; above it, it
+        # is cancelled in the same move as the requested roll.
+        self.deyaw_tolerance_deg = gp('deyaw_tolerance_deg').value
 
         # Fixed (X, Y) every roll+release targets -- see roll_dice()'s
         # docstring for why this must be a fixed, known-safe spot rather
@@ -232,7 +254,6 @@ class DiceManipulator:
         # roll_axis/roll_angle_deg are deliberately NOT cached: they are
         # the two knobs dice_task_orchestrator changes at runtime (via
         # set_parameters) before each call. See _current_roll().
-        self.velocity_scaling = gp('velocity_scaling').value
         self.identify_after = gp('identify_after').value
 
         self._dice_identification_client = create_dice_identification_client(
@@ -383,8 +404,7 @@ class DiceManipulator:
         self._log.info('Moving to home configuration...')
         res = self._safe_call(
             'move_to_joint(home)',
-            lambda: self._motion.move_to_joint(
-                self.home_joints, velocity_scaling=self.velocity_scaling),
+            lambda: self._motion.move_to_joint(self.home_joints),
             default=self._failed_moveit_result())
         return self._ok(res, 'move_to_joint(home)')
 
@@ -501,7 +521,8 @@ class DiceManipulator:
             default=self._failed_moveit_result())
         return self._ok(res, 'move_to_pose(lift)')
 
-    def roll_dice(self, table_z: float, current_quat: Quat) -> Optional[Quat]:
+    def roll_dice(self, table_z: float, current_quat: Quat,
+                  dice_quat_at_pick: Quat) -> Optional[Quat]:
         """
         Roll the held dice one quarter turn, translating to ``release_position``.
 
@@ -520,9 +541,27 @@ class DiceManipulator:
         ``pick_rotate_place()``). Returns the resulting world-frame tool
         orientation, or None on failure.
 
-        ``roll_axis == 'z'`` is accepted too, purely so
-        ``dice_task_orchestrator`` can drive its one-time pre-calibration
-        de-yaw straightening through this exact same
+        For an ``'x'``/``'y'`` roll, ``dice_quat_at_pick`` (the die's own
+        live orientation, read once at the very start of
+        ``pick_rotate_place()`` -- never a fresh mid-sequence TF lookup,
+        see the module docstring) is also checked for residual yaw about
+        world Z (``_yaw_error_deg()``, wrapped to the die's *nearest*
+        clean multiple of 90 -- a die release can leave it a few degrees
+        off). Below ``deyaw_tolerance_deg`` it is ignored; above it, a
+        cancelling world-Z rotation is folded into *this same* move,
+        applied before the requested roll (``roll_delta`` is still the
+        outermost/last rotation) -- one continuous grasp, one release,
+        instead of a separate straighten-then-reroll cycle that would
+        itself risk picking up fresh yaw on its own intermediate release.
+        This does not need ``dice_face_map`` to know about it:
+        ``from_two_faces()`` only assumes ``move`` is the *last* rotation
+        applied before ``face_after`` is observed, and does not care what,
+        if anything, happened before that -- see its docstring.
+
+        ``roll_axis == 'z'`` is accepted too (and skips the above
+        entirely -- it *is* the correction), purely so
+        ``dice_task_orchestrator`` can drive its own one-time
+        pre-calibration de-yaw straightening through this exact same
         set_parameters/~pick_rotate_place path -- see that module's
         docstring. ``CANDIDATE_ROLLS``/planning never produce ``'z'``, so
         this never happens as part of an actual face-changing roll; the
@@ -538,9 +577,24 @@ class DiceManipulator:
                     'y': (0.0, 1.0, 0.0),
                     'z': (0.0, 0.0, 1.0)}[axis]
         roll_delta = quaternion_about_axis(math.radians(angle_deg), axis_vec)
+
+        pre_roll_quat = current_quat
+        if axis in ('x', 'y') and self.deyaw_tolerance_deg > 0.0:
+            yaw_err_deg = _yaw_error_deg(dice_quat_at_pick)
+            if abs(yaw_err_deg) > self.deyaw_tolerance_deg:
+                self._log.info(
+                    f'Die yaw {yaw_err_deg:+.1f} deg off its nearest clean '
+                    f'orientation; cancelling it in the same move, before the '
+                    f'{axis}{angle_deg:+.0f}deg roll...')
+                deyaw_delta = quaternion_about_axis(
+                    math.radians(-yaw_err_deg), (0.0, 0.0, 1.0))
+                pre_roll_quat = quaternion_multiply(deyaw_delta, current_quat)
+
         # Extrinsic (world-frame) rotation on top of the current
         # orientation -- left-multiplied, unlike a body-relative roll.
-        world_quat = quaternion_multiply(roll_delta, current_quat)
+        # roll_delta stays the outermost/last rotation even when a
+        # de-yaw correction was folded in above, see the docstring.
+        world_quat = quaternion_multiply(roll_delta, pre_roll_quat)
 
         roll_pose = self._pose(
             self.world_frame,
@@ -730,7 +784,7 @@ class DiceManipulator:
             self._recover(place_xyz, current_quat)
             return False, 'lift failed'
 
-        roll_quat = self.roll_dice(place_xyz[2], current_quat)
+        roll_quat = self.roll_dice(place_xyz[2], current_quat, dice_quat_at_pick)
         if roll_quat is None:
             self._recover(place_xyz, current_quat)
             return False, 'rotation failed'
@@ -780,6 +834,10 @@ def _declare_parameters(node: Node) -> None:
     # Seconds to hold still after a gripper open/close command, so the
     # jaws physically settle / the die actually falls before the next move.
     node.declare_parameter('gripper_settle_time', 1.0)
+    # Below this (deg, from the die's nearest clean multiple-of-90 yaw)
+    # residual yaw from the last release is ignored; above it, roll_dice()
+    # cancels it in the same move as the requested roll. See roll_dice().
+    node.declare_parameter('deyaw_tolerance_deg', 1.0)
     # Fixed (X, Y) every roll carries the dice to before releasing -- see
     # roll_dice()'s and the module docstring's "Why release always happens
     # at a fixed spot". Default is the ur5e_1 table top's centre in
@@ -800,7 +858,6 @@ def _declare_parameters(node: Node) -> None:
     # dice_face_map.CANDIDATE_ROLLS. Overridden per-call by the orchestrator.
     node.declare_parameter('roll_angle_deg', 60.0)
 
-    node.declare_parameter('velocity_scaling', 1.0)
     node.declare_parameter('identify_after', True)
     node.declare_parameter('run_on_start', False)
 
