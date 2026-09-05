@@ -11,7 +11,7 @@ dice_manipulation_node:
     # Only used at the very start/end of pick_rotate_place() now -- the
     # roll itself happens near the table, see roll_axis/roll_angle_deg
     # below and roll_dice()'s docstring.
-    home_joints: [0.0, -1.97, 2.13, -1.83, -1.50, 0.0]
+    home_joints: [1.57, -1.7, 2.1, -1.9, -1.57, 0.0]
 
     # --- Gripper (hand-e, meters) -------------------------------------
     gripper_open: 0.045

@@ -131,12 +131,18 @@ class DiceDetectorNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         # Publishes dice_tf_frame live -- dice_manipulation_node's
-        # pick_dice() resolves its grasp poses against this TF at planning
-        # time, it does NOT use the /dice_identification response's pose
-        # for that (see dice_manipulation_node's module docstring, "Why
-        # position/orientation come from captured or just-commanded
-        # values"). Without this broadcast, face_number/pose would be
-        # right but nothing could actually grasp the die.
+        # grasp_orientation() reads it once (via the /dice_identification
+        # response's own pose, not a separate TF lookup) to decide which
+        # way the jaws should face; pick_dice() then builds both the
+        # approach and the grasp pose from that *same* single reading, in
+        # world_frame, rather than re-resolving this TF at each of the two
+        # separate moves (see dice_manipulation_node's module docstring,
+        # "Why position/orientation come from captured or just-commanded
+        # values, never a fresh TF lookup mid-sequence" -- frame-to-frame
+        # jitter in this broadcast was otherwise showing up as a visible
+        # extra rotation while descending onto the die). This TF still
+        # matters for RViz/debugging and for anything else that looks up
+        # dice_tf_frame live, just not for pick_dice()'s own two moves.
         self.tf_broadcaster = TransformBroadcaster(self)
         self._tf_warned = False
 
@@ -7044,11 +7050,17 @@ class DiceDetectorNode(Node):
         """
         Publish ``dice_tf_frame`` live, from an already world-frame pose.
 
-        This is what ``dice_manipulation_node.pick_dice()`` actually
-        grasps against (its ``dice_grasp_frame`` parameter, resolved by
-        MoveIt via TF at planning time) -- see the module docstring, "Why
-        the grasp yaw is picked before grasping". The /dice_identification
-        service response alone is not enough to make grasping work.
+        Kept for RViz/debugging and anything else that looks up
+        ``dice_tf_frame`` live; ``dice_manipulation_node`` itself no
+        longer resolves its actual grasp poses against this broadcast --
+        it grasps from the same world-frame pose carried in the
+        ``/dice_identification`` response, read once and reused for both
+        the approach and the grasp move (see that module's
+        ``pick_dice()``/``grasp_orientation()`` and the module docstring,
+        "Why the grasp yaw is picked before grasping" and "never a fresh
+        TF lookup mid-sequence"). The service response is what actually
+        makes grasping work; this broadcast does not need to be perfectly
+        jitter-free for that anymore.
         """
         if not self.publish_dice_tf:
             return

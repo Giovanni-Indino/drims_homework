@@ -144,6 +144,7 @@ from typing import Optional, Tuple
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.parameter import Parameter
 
 from geometry_msgs.msg import PoseStamped
 from std_srvs.srv import Trigger
@@ -228,6 +229,13 @@ class DiceManipulator:
         release_frame = gp('release_frame').value
         self.release_position = self._resolve_release_xy(
             float(release_xy[0]), float(release_xy[1]), release_frame)
+        # Write the resolved (world-frame) value back onto the parameter
+        # itself, so anything introspecting it later (dice_task_orchestrator's
+        # post-roll release-position sanity check, `ros2 param get`, ...)
+        # sees the number this node actually targets, not the pre-resolution
+        # value in `release_frame` units.
+        node.set_parameters([Parameter(
+            'release_position', Parameter.Type.DOUBLE_ARRAY, list(self.release_position))])
 
         # roll_axis/roll_angle_deg are deliberately NOT cached: they are
         # the two knobs dice_task_orchestrator changes at runtime (via
@@ -448,17 +456,40 @@ class DiceManipulator:
                 best_quat, best_score = candidate, score
         return best_quat
 
-    def pick_dice(self, grasp_quat: Quat) -> bool:
+    def pick_dice(self, dice_position: Xyz, dice_quat_at_pick: Quat,
+                  grasp_quat: Quat) -> bool:
         """
-        Approach from above and grasp on live ``dice_tf``, then attach.
+        Approach from above and grasp, both built once against the captured die pose.
 
-        ``grasp_quat`` (from ``grasp_orientation()``) is ``dice_tf``-flush
-        *and* already yawed for the upcoming roll -- see the module
-        docstring.
+        ``dice_position``/``dice_quat_at_pick`` are the die's live pose as
+        read *once*, at the very start of ``pick_rotate_place()`` (never
+        looked up again here); ``grasp_quat`` (from ``grasp_orientation()``)
+        is ``dice_tf``-flush *and* already yawed for the upcoming roll --
+        see the module docstring.
+
+        Both the pre-grasp approach and the grasp descent are computed
+        here as fully absolute ``world_frame`` poses from that single
+        snapshot, instead of each being expressed relative to the live
+        ``dice_grasp_frame`` and re-resolved by a fresh TF lookup at every
+        separate ``move_to_pose`` call (the previous approach). That
+        mattered on the real camera pipeline: any frame-to-frame jitter in
+        the live ``dice_tf`` estimate between the two calls showed up as a
+        visible extra rotation while descending from pre-grasp to grasp,
+        even though the die was never touched and the requested grasp
+        never changed. Same reasoning as the module docstring's "Why
+        position/orientation come from captured or just-commanded values,
+        never a fresh TF lookup mid-sequence", just applied one step
+        earlier -- before contact, not only from lift onward.
         """
-        approach = self._pose(self.dice_grasp_frame,
-                              (0.0, 0.0, self.approach_distance),
-                              grasp_quat)
+        world_quat = quaternion_multiply(dice_quat_at_pick, grasp_quat)
+
+        def _above(distance: float) -> Xyz:
+            # dice_grasp_frame's own +Z (out of the currently up-facing
+            # side) expressed in world, via the single captured orientation.
+            dx, dy, dz = _rotate_vector((0.0, 0.0, distance), dice_quat_at_pick)
+            return (dice_position[0] + dx, dice_position[1] + dy, dice_position[2] + dz)
+
+        approach = self._pose(self.world_frame, _above(self.approach_distance), world_quat)
         self._log.info('Moving to pre-grasp pose...')
         res = self._safe_call(
             'move_to_pose(pre-grasp)',
@@ -467,9 +498,7 @@ class DiceManipulator:
         if not self._ok(res, 'move_to_pose(pre-grasp)'):
             return False
 
-        grasp = self._pose(self.dice_grasp_frame,
-                           (0.0, 0.0, self.grasp_offset),
-                           grasp_quat)
+        grasp = self._pose(self.world_frame, _above(self.grasp_offset), world_quat)
         self._log.info('Descending to grasp pose...')
         res = self._safe_call(
             'move_to_pose(grasp)',
@@ -720,7 +749,7 @@ class DiceManipulator:
         axis, _ = self._current_roll()
         grasp_quat = self.grasp_orientation(dice_quat_at_pick, axis)
 
-        if not self.pick_dice(grasp_quat):
+        if not self.pick_dice(place_xyz, dice_quat_at_pick, grasp_quat):
             return False, 'pick failed'
 
         # From here on the dice is rigidly attached: any failure below

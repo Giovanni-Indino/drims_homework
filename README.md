@@ -126,3 +126,8 @@ consistent canonical orientation; a face number such as 1, 4 or 5 cannot by
 itself remove every 90-degree ambiguity. The node intentionally only localizes
 the die; exposing it through the package's `dice_identification` service and
 recognizing the upper face are the next pipeline steps.
+
+
+
+ros2 launch drims_homework dice_localizer_stable_start.launch.py
+

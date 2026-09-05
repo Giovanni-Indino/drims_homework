@@ -151,7 +151,7 @@ from rclpy.node import Node
 
 from geometry_msgs.msg import PoseStamped
 from std_srvs.srv import Trigger
-from rcl_interfaces.srv import SetParameters
+from rcl_interfaces.srv import GetParameters, SetParameters
 from rclpy.parameter import Parameter
 
 from drims_homework.dice_common import create_dice_identification_client, identify_dice
@@ -219,6 +219,10 @@ class DiceTaskOrchestrator:
         # See _calibrate()'s de-yaw pre-step: below this the die is
         # considered already at yaw 0 and straightening is skipped.
         self.deyaw_tolerance_deg = gp('deyaw_tolerance_deg').value
+        # See _post_roll_sanity_check(): how far (m, world XY) the die may
+        # be found from dice_manipulation_node's own release_position
+        # after a roll before that roll is distrusted entirely.
+        self.release_position_tolerance_m = gp('release_position_tolerance_m').value
 
         self._dice_identification_client = create_dice_identification_client(
             self._client_node, gp('dice_identification_service').value)
@@ -226,6 +230,14 @@ class DiceTaskOrchestrator:
             Trigger, f'/{self.manipulation_node_name}/pick_rotate_place')
         self._set_parameters_client = self._client_node.create_client(
             SetParameters, f'/{self.manipulation_node_name}/set_parameters')
+        self._get_parameters_client = self._client_node.create_client(
+            GetParameters, f'/{self.manipulation_node_name}/get_parameters')
+
+        # dice_manipulation_node's own release_position, in world -- lazily
+        # fetched and cached the first time _post_roll_sanity_check() needs
+        # it (a fixed robot-cell constant, not something that changes
+        # mid-run). See _fetch_release_position().
+        self._release_position_world: Optional[Tuple[float, float]] = None
 
         # The die's tracked orientation, or None if not (yet) known --
         # see the module docstring's "Calibration". Kept for this node's
@@ -302,15 +314,111 @@ class DiceTaskOrchestrator:
         Identify the die; return ``(face_number, pose)``.
 
         Unlike ``_identify_face()``, also hands back the raw pose --
-        used only right before a possible ``CALIBRATE``/``_calibrate()``
-        (see ``plan_target_face()`` and ``reach_target_face()``'s
-        ``IDENTIFY`` state), and only so ``_calibrate()`` can measure the
-        die's current yaw about world Z for its one-time straightening
-        pre-step. Every other identification in this module still goes
-        through ``_identify_face()`` and never looks at the pose, per
-        the module docstring's "Calibration".
+        used right before a possible ``CALIBRATE``/``_calibrate()`` (see
+        ``plan_target_face()`` and ``reach_target_face()``'s ``IDENTIFY``
+        state, where ``_calibrate()`` uses it to measure the die's
+        current yaw about world Z for its one-time straightening
+        pre-step) and right after every executed roll (``VERIFY``/
+        ``execute_planned_sequence()``, where ``_post_roll_sanity_check()``
+        uses it to sanity-check the roll's actual landing position -- see
+        that method). Never used for reconstructing the die's *layout*,
+        though -- that stays exclusively ``face_number``-based
+        (``from_two_faces()``), per the module docstring's "Calibration".
         """
         return identify_dice(self._client_node, self._dice_identification_client)
+
+    def _fetch_release_position(self) -> Optional[Tuple[float, float]]:
+        """
+        Fetch and cache ``dice_manipulation_node``'s resolved ``release_position``.
+
+        A fixed property of this robot cell (where every roll intentionally
+        carries the die to, see that module's docstring), not something
+        that changes mid-run -- fetched once via ``get_parameters`` and
+        cached in ``self._release_position_world`` from then on.
+        ``dice_manipulation_node`` writes the *resolved* (world-frame)
+        value back onto this same parameter at its own start-up (see its
+        ``_resolve_release_xy()``), so this is always directly comparable
+        to a live ``/dice_identification`` pose regardless of what frame
+        its own ``release_position``/``release_frame`` config was given
+        in. Returns ``None`` (callers must skip the check) if the service
+        is not up or the parameter comes back malformed -- this is a
+        best-effort sanity check, never something a roll should block on.
+        """
+        if not self._get_parameters_client.wait_for_service(timeout_sec=5.0):
+            self._log.warn(
+                f"'{self.manipulation_node_name}/get_parameters' not available; "
+                f'cannot sanity-check the die release position.')
+            return None
+
+        request = GetParameters.Request(names=['release_position'])
+        future = self._get_parameters_client.call_async(request)
+        rclpy.spin_until_future_complete(self._client_node, future)
+        result = future.result()
+        if result is None or not result.values:
+            self._log.warn(
+                'get_parameters(release_position) failed; skipping release-position check.')
+            return None
+
+        xy = list(result.values[0].double_array_value)
+        if len(xy) < 2:
+            self._log.warn(
+                f'unexpected release_position value {xy!r}; skipping release-position check.')
+            return None
+
+        self._log.info(f'release_position (world) = [{xy[0]:.3f}, {xy[1]:.3f}]')
+        return (xy[0], xy[1])
+
+    def _post_roll_sanity_check(
+            self, pre_roll_orientation: Optional[DiceOrientation], move: Move,
+            new_face: int, pose: Optional[PoseStamped]) -> Optional[str]:
+        """
+        Sanity-check a just-executed roll before trusting it going forward.
+
+        Returns ``None`` if the roll looks clean, or a short reason string
+        otherwise; callers (``VERIFY``, ``execute_planned_sequence()``)
+        respond by dropping the tracked orientation and restarting from
+        ``IDENTIFY``/``CALIBRATE`` (a fresh calibration roll re-lands the
+        die at ``release_position`` too) rather than trusting
+        ``from_two_faces()`` on a roll that may not actually have been the
+        clean quarter turn it assumes -- see that function's docstring for
+        why an unmodelled extra rotation would otherwise corrupt tracking
+        silently, not loudly. Two independent checks, either is enough to
+        distrust the roll:
+
+        * **Face mismatch.** If the pre-roll orientation is known,
+          ``pre_roll_orientation.rolled(move).up_face`` is the face the
+          model says *must* end up top -- ``move`` is always a clean
+          quarter turn in the model regardless of the (deliberately
+          under-rotated, see ``dice_manipulation_config.yaml``'s
+          ``roll_angle_deg``) commanded magnitude, so a mismatch means
+          the physical roll did not land the way the model assumes
+          (over/under-tipped, bounced onto a third face, ...).
+        * **Position drift.** If ``pose`` and ``release_position`` (see
+          ``_fetch_release_position()``) are both available, the die is
+          expected within ``release_position_tolerance_m`` of that fixed
+          spot -- ``roll_dice()`` always carries it there in the same
+          move as the rotation. Ending up much farther away means the
+          release did not go as planned (a bad grasp, a bounce/roll off
+          the intended spot, ...), regardless of what face ended up up.
+        """
+        if pre_roll_orientation is not None:
+            predicted_face = pre_roll_orientation.rolled(move).up_face
+            if predicted_face != new_face:
+                return (f'face after the roll is {new_face}, expected {predicted_face} '
+                       f'from the tracked layout -- the roll did not land as modelled')
+
+        if pose is not None:
+            if self._release_position_world is None:
+                self._release_position_world = self._fetch_release_position()
+            if self._release_position_world is not None:
+                rx, ry = self._release_position_world
+                deviation = math.hypot(pose.pose.position.x - rx, pose.pose.position.y - ry)
+                if deviation > self.release_position_tolerance_m:
+                    return (f'die is {deviation:.3f} m from release_position '
+                           f'[{rx:.3f}, {ry:.3f}] (tolerance '
+                           f'{self.release_position_tolerance_m:.3f} m)')
+
+        return None
 
     # ------------------------------------------------------------------ #
     # Shared roll execution (used by both the automatic state machine    #
@@ -488,13 +596,19 @@ class DiceTaskOrchestrator:
         and correct regardless of anything that happened since
         ``plan_target_face()``), and re-derives the tracked orientation
         again after every single roll via ``from_two_faces()`` (exact,
-        not a prediction -- see the module docstring). If the tracked
-        orientation is stale when this is called (e.g. the die was moved
-        since ``plan_target_face()``), this does **not** silently spend a
-        calibration roll -- it fails and asks for ``~/plan_target_face``
-        again, so a caller reviewing the plan before running it is never
-        surprised by an extra, unplanned roll. Stops at the first roll
-        that does not succeed and reports how far it got.
+        not a prediction -- see the module docstring) -- but only once
+        that roll passes ``_post_roll_sanity_check()`` (right face,
+        landed near ``release_position``); otherwise the tracked
+        orientation is dropped and this stops immediately, asking for
+        ``~/plan_target_face`` again so the next call starts over from
+        ``IDENTIFY``/``CALIBRATE`` rather than trusting a roll that did
+        not land as modelled. If the tracked orientation is stale when
+        this is called (e.g. the die was moved since ``plan_target_face()``),
+        this does **not** silently spend a calibration roll -- it fails
+        and asks for ``~/plan_target_face`` again, so a caller reviewing
+        the plan before running it is never surprised by an extra,
+        unplanned roll. Stops at the first roll that does not succeed
+        and reports how far it got.
         """
         if self._pending_target is None:
             return False, 'no plan pending; call ~/plan_target_face first'
@@ -529,11 +643,21 @@ class DiceTaskOrchestrator:
                 return False, (f'sequence execution stopped after {i - 1} successful '
                                f'roll(s): {message}')
 
-            new_face = self._identify_face()
+            new_face, pose = self._identify()
             if new_face is None:
                 self._orientation = None
                 self._pending_target = None
                 return False, 'post-roll dice identification failed'
+
+            distrust_reason = self._post_roll_sanity_check(
+                self._orientation, move, new_face, pose)
+            if distrust_reason is not None:
+                self._orientation = None
+                self._pending_target = None
+                return False, (f'sequence execution stopped after {i - 1} successful '
+                               f'roll(s): roll {i} landed unexpectedly ({distrust_reason}); '
+                               f'call ~/plan_target_face again to recalibrate')
+
             self._orientation = DiceOrientation.from_two_faces(face, move, new_face)
             face = new_face
 
@@ -620,11 +744,22 @@ class DiceTaskOrchestrator:
                 state = State.IDENTIFY
 
             elif state == State.VERIFY:
-                new_face = self._identify_face()
+                new_face, pose = self._identify()
                 if new_face is None:
                     state = State.FAILED
                     fail_reason = 'post-roll dice identification failed'
                     continue
+
+                distrust_reason = self._post_roll_sanity_check(
+                    self._orientation, move, new_face, pose)
+                if distrust_reason is not None:
+                    self._log.warn(
+                        f'Roll landed unexpectedly ({distrust_reason}); restarting from '
+                        f'IDENTIFY/CALIBRATE instead of trusting it.')
+                    self._orientation = None
+                    state = State.IDENTIFY
+                    continue
+
                 self._orientation = DiceOrientation.from_two_faces(face, move, new_face)
                 self._log.info(f'Now: {self._orientation.describe()}')
                 face = new_face
@@ -654,6 +789,10 @@ def _declare_parameters(node: Node) -> None:
     # See _calibrate()'s de-yaw pre-step: below this (deg) the die is
     # considered already at yaw 0 and straightening is skipped.
     node.declare_parameter('deyaw_tolerance_deg', 1.0)
+    # See _post_roll_sanity_check(): how far (m, world XY) the die may be
+    # found from dice_manipulation_node's release_position after a roll
+    # before that roll is distrusted and the tracked orientation dropped.
+    node.declare_parameter('release_position_tolerance_m', 0.05)
     node.declare_parameter('manipulation_node_name', 'dice_manipulation_node')
     node.declare_parameter('dice_identification_service', 'dice_identification')
     node.declare_parameter('run_on_start', False)
