@@ -34,6 +34,7 @@ make that boundary explicit and to avoid duplicating the same service-call
 boilerplate in every node.
 """
 
+import time
 from typing import Optional, Tuple
 
 import rclpy
@@ -54,31 +55,56 @@ def create_dice_identification_client(node: Node,
 
 
 def identify_dice(node: Node, client: Client,
-                  timeout_sec: float = 5.0
+                  timeout_sec: float = 5.0,
+                  retries: int = 10,
+                  retry_delay: float = 1.0,
                   ) -> Tuple[Optional[int], Optional[PoseStamped]]:
     """
     Call ``/dice_identification`` and return ``(face_number, pose)``.
 
-    Returns ``(None, None)`` if the service is unavailable, times out, or
-    reports failure — callers should treat that as "perception layer not
-    ready / could not localize the dice", not as a face number.
+    The service's own availability is checked once, fast-fail (a
+    perception layer that is not even up will not come up by waiting a
+    bit longer -- that is a real, immediate failure every caller should
+    hear about right away). Once it *is* up, a single failed response
+    (``success=False``) is retried up to ``retries`` times,
+    ``retry_delay`` seconds apart, before finally giving up -- in
+    practice a real camera can take a moment to refocus/re-expose right
+    after the dice was just placed (a fresh pick, or the instant after a
+    roll's release), so the very next identification call can transiently
+    fail even though the dice is right there and about to be found.
+    Bailing out on that first miss would kill the whole task for
+    something that resolves itself a second later; waiting here instead
+    means every caller gets that patience for free.
+
+    Returns ``(None, None)`` if the service is unavailable, or if it kept
+    reporting failure for every attempt — callers should treat that as
+    "perception layer not ready / could not localize the dice", not as a
+    face number.
     """
     if not client.wait_for_service(timeout_sec=timeout_sec):
         node.get_logger().error(
             f"'{client.srv_name}' service not available")
         return None, None
 
-    future = client.call_async(DiceIdentification.Request())
-    rclpy.spin_until_future_complete(node, future)
-    result = future.result()
+    for attempt in range(retries):
+        future = client.call_async(DiceIdentification.Request())
+        rclpy.spin_until_future_complete(node, future)
+        result = future.result()
 
-    if result is None or not result.success:
-        node.get_logger().error('Dice identification failed')
-        return None, None
+        if result is not None and result.success:
+            node.get_logger().info(
+                f'Dice identified: face={result.face_number}, '
+                f'pos=[{result.pose.pose.position.x:.3f}, '
+                f'{result.pose.pose.position.y:.3f}, '
+                f'{result.pose.pose.position.z:.3f}] ({result.pose.header.frame_id})')
+            return result.face_number, result.pose
 
-    node.get_logger().info(
-        f'Dice identified: face={result.face_number}, '
-        f'pos=[{result.pose.pose.position.x:.3f}, '
-        f'{result.pose.pose.position.y:.3f}, '
-        f'{result.pose.pose.position.z:.3f}] ({result.pose.header.frame_id})')
-    return result.face_number, result.pose
+        if attempt < retries - 1:
+            node.get_logger().warn(
+                f'Dice identification failed (attempt {attempt + 1}/{retries}); '
+                f'retrying in {retry_delay:.1f}s -- the camera may still be '
+                f'settling/refocusing on the dice.')
+            time.sleep(retry_delay)
+
+    node.get_logger().error(f'Dice identification failed after {retries} attempts')
+    return None, None

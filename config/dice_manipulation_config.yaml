@@ -43,16 +43,6 @@ dice_manipulation_node:
     # wrist/gripper never drives into the table. Lowered by 1 cm again
     # (was 0.03) -- release wanted 1 cm closer to the table.
     place_safety_height: 0.007
-    # Residual world-Z yaw (deg, from the die's nearest clean multiple of
-    # 90) below which roll_dice() ignores it; above it, cancelled in the
-    # same pick-lift-roll-place cycle as the requested roll, before the
-    # roll itself (never a separate straighten-then-reroll trip, which
-    # would risk picking up fresh yaw on its own intermediate release --
-    # see roll_dice()'s docstring). Runs on every 'x'/'y' roll, not just
-    # dice_task_orchestrator's own one-time pre-calibration de-yaw (its
-    # deyaw_tolerance_deg), which stays as the explicit first-ever
-    # straightening when nothing is tracked yet.
-    deyaw_tolerance_deg: 10.0
     # Fixed (X, Y) EVERY roll carries the dice to, in the same move as the
     # rotation, before releasing -- see dice_manipulation_node's module
     # docstring, "Why release always happens at a fixed spot": wherever the
